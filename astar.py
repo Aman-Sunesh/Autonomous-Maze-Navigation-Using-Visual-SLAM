@@ -198,6 +198,7 @@ class KeyboardPlayerPyGame(Player):
         # --- A* PATH VISUALIZATION STATE ---
         self.global_path = []              # list of (world_x, world_y)
         self.goal_world_coords = None      # (gx, gy)
+        self.last_path_start_px = None     # cache to avoid replanning every tiny change
 
         super().__init__()
 
@@ -261,6 +262,7 @@ class KeyboardPlayerPyGame(Player):
         self.historic_v_walls = []
         self.historic_h_walls = []
         self.global_path = []
+        self.last_path_start_px = None
         pygame.init()
         self.keymap = {
             pygame.K_LEFT: Action.LEFT,
@@ -281,10 +283,11 @@ class KeyboardPlayerPyGame(Player):
         y = (self.map_offset - py) / self.map_scale
         return x, y
 
-    def plan_astar_path(self):
+    def plan_astar_path(self, force=False):
         """
-        Build one fixed geometric shortest path on the cleaned maze map
-        from the initial localized pose to the goal position.
+        Build a geometric shortest path on the cleaned maze map
+        from the current odometry position to the goal position.
+        This is only for visualization; it does not automate control.
         """
         if self.odom is None or self.goal_world_coords is None or self.occupancy_map is None:
             self.global_path = []
@@ -292,6 +295,11 @@ class KeyboardPlayerPyGame(Player):
 
         start_px, start_py = self.world_to_pixel(self.odom.x, self.odom.y)
         goal_px, goal_py = self.world_to_pixel(self.goal_world_coords[0], self.goal_world_coords[1])
+
+        # Avoid replanning if the robot has barely moved in map pixels
+        if not force and self.last_path_start_px is not None:
+            if np.hypot(start_px - self.last_path_start_px[0], start_py - self.last_path_start_px[1]) < 8:
+                return
 
         # Inflate walls slightly in memory so the visualized path stays centered
         kernel = np.ones((7, 7), np.uint8)
@@ -330,6 +338,7 @@ class KeyboardPlayerPyGame(Player):
 
         if not path_found:
             self.global_path = []
+            self.last_path_start_px = (start_px, start_py)
             return
 
         curr = (goal_px, goal_py)
@@ -339,8 +348,9 @@ class KeyboardPlayerPyGame(Player):
             curr = came_from[curr]
         path_pixels.reverse()
 
-         # Light subsampling keeps the displayed fixed path cleaner
+        # Light subsampling keeps the displayed path cleaner
         self.global_path = [self.pixel_to_world(px, py) for (px, py) in path_pixels[::3]]
+        self.last_path_start_px = (start_px, start_py)
 
     def act(self):
         for event in pygame.event.get():
@@ -385,10 +395,6 @@ class KeyboardPlayerPyGame(Player):
                 else:
                     self.odom = PureOdometry(0.0, 0.0, 0.0)
                 self.last_time = current_time
-
-                # Build the A* path once from the initial localized pose
-                if self.goal_world_coords is not None and not self.global_path:
-                    self.plan_astar_path() 
 
             # --- 2. KINEMATIC INTEGRATION (Runs every frame) ---
             elif self.last_time is not None:
@@ -632,6 +638,9 @@ class KeyboardPlayerPyGame(Player):
     def display_global_map(self):
         if self.slam_map is None or self.goal_node is None: return
         display_map = self.slam_map.copy()
+
+        # Draw the geometric shortest path updated on the map
+        self.plan_astar_path()
 
         goal_file = self.file_list[self.goal_node]
         if goal_file in self.frame_poses:
