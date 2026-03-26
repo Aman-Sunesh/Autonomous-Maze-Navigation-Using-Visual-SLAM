@@ -200,7 +200,7 @@ class KeyboardPlayerPyGame(Player):
         self.goal_world_coords = None      # (gx, gy)
         self.is_autonomous = False
         self.lookahead_dist = 0.12
-        self.goal_reach_dist = 0.10
+        self.goal_reach_dist = 0.025
         self.path_replan_dist = 0.35
 
         super().__init__()
@@ -301,7 +301,7 @@ class KeyboardPlayerPyGame(Player):
         # Build a strict free-space mask from the cleaned map:
         # only bright white corridor is drivable.
         free_mask = np.zeros_like(self.occupancy_map, dtype=np.uint8)
-        free_mask[self.occupancy_map > 240] = 255
+        free_mask[self.occupancy_map > 150] = 255
 
         # Add a bit more wall margin so the path sits away from walls.
         kernel = np.ones((5, 5), np.uint8)
@@ -407,8 +407,16 @@ class KeyboardPlayerPyGame(Player):
         goal = np.array(self.goal_world_coords, dtype=np.float32)
 
         # Auto-finish near the target
-        if np.linalg.norm(goal - robot) < self.goal_reach_dist:
-            print("[AUTO] Goal reached. CHECKIN.")
+        goal_dist = np.linalg.norm(goal - robot)
+
+        path_end_dist = np.inf
+        if self.global_path:
+            path_end = np.array(self.global_path[-1], dtype=np.float32)
+            path_end_dist = np.linalg.norm(path_end - robot)
+
+        # Exact goal OR close enough to final A* endpoint
+        if goal_dist < self.goal_reach_dist or path_end_dist < 0.035:
+            print(f"[AUTO] Goal reached. CHECKIN. goal_dist={goal_dist:.3f}, path_end_dist={path_end_dist:.3f}")
             self.is_autonomous = False
             return Action.CHECKIN
 
