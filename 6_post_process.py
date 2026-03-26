@@ -117,25 +117,24 @@ class MapBuilder:
         self.offset_y = map_size // 2
         self.grid = np.ones((self.map_size, self.map_size, 3), dtype=np.uint8) * 127
         
-        # --- NEW: Draw 0.4m x 0.4m background grid with 0.2m offset ---
+        # --- NEW: REAL-TIME WALL DATA DICTIONARY ---
+        # Maps visual pixel coordinates (px, py) to world coordinates (wx, wy)
+        self.live_2d_walls = {} 
+        
         grid_m = 0.4
         offset_m = 0.2
         grid_px = int(grid_m * self.scale)
         offset_px = int(offset_m * self.scale)
-        grid_color = (100, 100, 100) # Dark enough to see, but not [0,0,0] to avoid wall triggers
+        grid_color = (100, 100, 100) 
         
-        # Draw vertical lines (outwards from the 0.2m offset center)
         for x in range(self.offset_x + offset_px, self.map_size, grid_px):
             cv2.line(self.grid, (x, 0), (x, self.map_size), grid_color, 1)
         for x in range(self.offset_x - offset_px, -1, -grid_px):
             cv2.line(self.grid, (x, 0), (x, self.map_size), grid_color, 1)
-            
-        # Draw horizontal lines (outwards from the 0.2m offset center)
         for y in range(self.offset_y + offset_px, self.map_size, grid_px):
             cv2.line(self.grid, (0, y), (self.map_size, y), grid_color, 1)
         for y in range(self.offset_y - offset_px, -1, -grid_px):
             cv2.line(self.grid, (0, y), (self.map_size, y), grid_color, 1)
-        # ---------------------------------------------
         
         self.trajectory = []
         self.frame_poses = {} 
@@ -145,15 +144,25 @@ class MapBuilder:
         py = int(self.offset_y - (y * self.scale)) 
         return px, py
 
-    def update_grid(self, robot_x, robot_y, global_wall_points):
+    def update_grid(self, robot_x, robot_y, global_wall_points, global_open_points):
         rpx, rpy = self.world_to_pixel(robot_x, robot_y)
         
+        # 1. Create a hidden background mask to track exactly where the clearing rays go
+        ray_mask = np.zeros((self.map_size, self.map_size), dtype=np.uint8)
+
+        # Draw rays into open space
+        for ox, oy in global_open_points:
+            opx, opy = self.world_to_pixel(ox, oy)
+            if 0 <= opx < self.map_size and 0 <= opy < self.map_size and 0 <= rpx < self.map_size and 0 <= rpy < self.map_size:
+                cv2.line(ray_mask, (rpx, rpy), (opx, opy), 255, 2)
+                cv2.line(self.grid, (rpx, rpy), (opx, opy), (255, 255, 255), 2)
+
+        # Draw rays up to the physical walls
+        snapped_walls = []
         for wx, wy in global_wall_points:
-            # Find the nearest 0.4m grid line (accounting for the 0.2m start offset)
             snapped_x = round((wx - 0.2) / 0.4) * 0.4 + 0.2
             snapped_y = round((wy - 0.2) / 0.4) * 0.4 + 0.2
             
-            # Snap the point to whichever grid line (vertical or horizontal) it is closest to
             if abs(wx - snapped_x) < abs(wy - snapped_y):
                 wx = snapped_x
             else:
@@ -162,10 +171,37 @@ class MapBuilder:
             wpx, wpy = self.world_to_pixel(wx, wy)
             
             if 0 <= wpx < self.map_size and 0 <= wpy < self.map_size and 0 <= rpx < self.map_size and 0 <= rpy < self.map_size:
-                # Draw the ray clearing free space up to the snapped wall
+                snapped_walls.append((wx, wy, wpx, wpy))
+                cv2.line(ray_mask, (rpx, rpy), (wpx, wpy), 255, 2)
                 cv2.line(self.grid, (rpx, rpy), (wpx, wpy), (255, 255, 255), 2)
-                # Draw the snapped wall point
-                cv2.circle(self.grid, (wpx, wpy), 3, (0, 0, 0), -1)
+
+        # --- 2. THE REAL-TIME DATA REMOVAL ---
+        # Find every single pixel the white rays touched on the hidden mask
+        erased_y, erased_x = np.where(ray_mask == 255)
+        
+        # Instantly delete those coordinates from our active memory
+        for px, py in zip(erased_x, erased_y):
+            self.live_2d_walls.pop((px, py), None)
+
+        # # --- 3. ADD NEW WALLS --- MAYBE FASTER
+        # for wx, wy, wpx, wpy in snapped_walls:
+        #     # Draw the fat blob for the human eyes
+        #     cv2.circle(self.grid, (wpx, wpy), 3, (0, 0, 0), -1)
+            
+        #     # Save ONLY the exact center coordinate to the data dictionary.
+        #     # If a clearing ray hits this single anchor pixel later, the whole wall is deleted.
+        #     self.live_2d_walls[(wpx, wpy)] = (wx, wy)
+            
+        # --- 3. ADD NEW WALLS ---
+        for wx, wy, wpx, wpy in snapped_walls:
+            cv2.circle(self.grid, (wpx, wpy), 3, (0, 0, 0), -1)
+            
+            # Map every pixel of the drawn circle to this coordinate
+            # If a ray grazes the edge of the visual circle later, it deletes the data instantly.
+            for dx in range(-3, 4):
+                for dy in range(-3, 4):
+                    if dx*dx + dy*dy <= 9:
+                        self.live_2d_walls[(wpx+dx, wpy+dy)] = (wx, wy)
 
     def draw(self, robot_x, robot_y, theta, mode_str, img_filename=None):
         px, py = self.world_to_pixel(robot_x, robot_y)
@@ -350,27 +386,39 @@ def run_offline_slam():
             est_x, est_y, est_theta = odom.x, odom.y, odom.theta
             
             global_wall_points = []
-            for X_robot, Y_robot in all_local:
-                # 1. Convert to raw global coordinates
+            global_open_points = []
+            
+            for pt in all_local:
+                # Handle both the old (2-item) and new (3-item) extract_wall_points output
+                if len(pt) == 3:
+                    X_robot, Y_robot, is_wall = pt
+                else:
+                    X_robot, Y_robot = pt
+                    is_wall = True 
+
                 X_world = est_x + (X_robot * np.cos(est_theta) - Y_robot * np.sin(est_theta))
                 Y_world = est_y + (X_robot * np.sin(est_theta) + Y_robot * np.cos(est_theta))
                 
-                # 2. Snap the raw global point to the 0.4m grid (with 0.2m offset)
-                snapped_x = round((X_world - 0.2) / 0.4) * 0.4 + 0.2
-                snapped_y = round((Y_world - 0.2) / 0.4) * 0.4 + 0.2
-                
-                # Snap only the axis it is closest to, maintaining flat wall segments
-                if abs(X_world - snapped_x) < abs(Y_world - snapped_y):
-                    X_world = snapped_x
-                else:
-                    Y_world = snapped_y
+                if is_wall:
+                    # Snap the real walls
+                    snapped_x = round((X_world - 0.2) / 0.4) * 0.4 + 0.2
+                    snapped_y = round((Y_world - 0.2) / 0.4) * 0.4 + 0.2
                     
-                global_wall_points.append((X_world, Y_world))
+                    if abs(X_world - snapped_x) < abs(Y_world - snapped_y):
+                        X_world = snapped_x
+                    else:
+                        Y_world = snapped_y
+                        
+                    global_wall_points.append((X_world, Y_world))
+                else:
+                    # Save the open space rays (Un-snapped)
+                    global_open_points.append((X_world, Y_world))
 
             if img_filename:
                 frame_walls[img_filename] = global_wall_points
 
-            map_builder.update_grid(est_x, est_y, global_wall_points)
+            # Fire both lists into the MapBuilder so it draws walls AND erases ghost pixels
+            map_builder.update_grid(est_x, est_y, global_wall_points, global_open_points)
             
             map_mode_text = status if status != "MOVING" else "Loop Closure SLAM"
             map_builder.draw(est_x, est_y, est_theta, map_mode_text, img_filename)
@@ -403,9 +451,10 @@ def run_offline_slam():
     with open("cache/frame_poses.json", "w") as f:
         json.dump(map_builder.frame_poses, f)
         
-    # --- ADD THIS: Export the raw SLAM wall data ---
-    with open("cache/slam_walls.json", "w") as f:
-        json.dump(frame_walls, f)
+    # Extract the unique (x, y) coordinates of the surviving walls
+    surviving_walls = list(set(map_builder.live_2d_walls.values()))
+    with open("cache/slam_walls_realtime_cleaned.json", "w") as f:
+        json.dump(surviving_walls, f)
         
     cv2.destroyAllWindows()
                  
