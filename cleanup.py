@@ -271,4 +271,4 @@ def visualize_map_with_trajectory(walls_path="cache/slam_walls_realtime_cleaned.
 if __name__ == "__main__":
     # 'threshold' controls how much wall evidence is required to keep a wall segment.
     # Higher threshold = stricter wall filtering, lower threshold = more walls kept.
-    visualize_map_with_trajectory(threshold=0.6)
+    visualize_map_with_trajectory(threshold=0.4)
