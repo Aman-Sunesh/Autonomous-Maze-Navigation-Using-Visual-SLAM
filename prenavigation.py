@@ -512,7 +512,6 @@ class VisualStuckDetector:
 
         # Ignore the calculated shift if low confidence
         if confidence < self.conf_thresh:
-            print(confidence)
             dx = 0.0
 
         # Calculate the pixel difference between the two frames
