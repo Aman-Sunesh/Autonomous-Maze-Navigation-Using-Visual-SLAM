@@ -8,7 +8,7 @@ the exploration images, and the live FPV camera stream, and turn that into a
 fully autonomous navigation policy.
 
 Main idea of the pipeline:
-- Use SIFT / RootSIFT / VLAD to match the current camera view against the
+- Use SIFT / VLAD to match the current camera view against the
   exploration images.
 - Use the cleaned metric map and stored frame poses from SLAM to localize the
   robot in world coordinates.
@@ -37,8 +37,8 @@ import time
 # Constants
 # ---------------------------------------------------------------------------
 CACHE_DIR = "cache"
-IMAGE_DIR = "data/images/"
-DATA_INFO_PATH = "data/images/data_info.json"
+IMAGE_DIR = "data/exploration_images/traj_0"
+DATA_INFO_PATH = "data/data_info.json"
 PATH_CACHE_FILE = os.path.join(CACHE_DIR, "astar_path_cache.pkl")
 
 # Graph construction settings.
@@ -54,7 +54,7 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 # ---------------------------------------------------------------------------
 # Geometry / Motion Helpers
 # ---------------------------------------------------------------------------
-class PureOdometry:
+class Odometry:
     """Simple planar odometry state used during navigation."""
 
     def __init__(self, initial_x=0.0, initial_y=0.0, initial_theta=0.0):
@@ -745,11 +745,11 @@ class KeyboardPlayerPyGame(Player):
                 
                 if best_file in self.frame_poses:
                     wx, wy, wtheta = self.frame_poses[best_file]
-                    self.odom = PureOdometry(wx, wy, wtheta)
+                    self.odom = Odometry(wx, wy, wtheta)
                     print(f"\n[!] VLAD Initialized Position: X={wx:.2f}, Y={wy:.2f}, Theta={np.rad2deg(wtheta):.0f}deg")
                 else:
                     # Fallback only in case pose lookup fails.
-                    self.odom = PureOdometry(0.0, 0.0, 0.0)
+                    self.odom = Odometry(0.0, 0.0, 0.0)
                 self.last_time = current_time
 
                 # Build the A* path once from the initial localized pose
