@@ -29,8 +29,8 @@ import numpy as np
 # * indicates important paramameter for tunning
 # ---------------------------------------------------------------------------
 # Data paths
-DATA_INFO_PATH = "data/images/data_info.json"
-IMAGE_DIR = "data/images/"
+DATA_INFO_PATH = "data/data_info.json"
+IMAGE_DIR = "data/exploration_data/traj_0"
 
 # Odometry parameters
 BASE_V = 2.9462             # linear velocity
