@@ -1,6 +1,23 @@
 """
-Level-1 Visual Navigation with Robust State Estimation
-Pipeline: Pure Kinematics + Manhattan Geometric Constraints + VLAD Global Relocalization
+run.py
+----------------------
+This is the main challenge-time navigation file.
+
+The goal of this file is to take the cleaned map from the offline SLAM stage,
+the exploration images, and the live FPV camera stream, and turn that into a
+fully autonomous navigation policy.
+
+Main idea of the pipeline:
+- Use SIFT / RootSIFT / VLAD to match the current camera view against the
+  exploration images.
+- Use the cleaned metric map and stored frame poses from SLAM to localize the
+  robot in world coordinates.
+- Build a safe A* route to the target on that metric map.
+- Follow the route with a simple controller that turns toward the path, checks
+  whether forward motion is safe, avoids obstacles, and replans if the pose 
+  drifts too far.
+
+In short, this file is the online navigation brain of the project.
 """
 
 from vis_nav_game import Player, Action, Phase
@@ -23,7 +40,9 @@ CACHE_DIR = "cache"
 IMAGE_DIR = "data/images/"
 DATA_INFO_PATH = "data/data_info.json"
 
-# Graph construction
+# Graph construction settings.
+# Temporal edges follow the exploration order, while visual edges add a few
+# strong long-range shortcuts between visually similar frames.
 TEMPORAL_WEIGHT = 1.0       # edge weight for consecutive frames
 VISUAL_WEIGHT_BASE = 2.0    # base weight for visual shortcut edges
 VISUAL_WEIGHT_SCALE = 3.0   # weight += scale * vlad_distance
@@ -32,15 +51,18 @@ MIN_SHORTCUT_GAP = 50       # minimum trajectory index gap for shortcuts
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 # ---------------------------------------------------------------------------
-# 1. Math Models & Detectors
+# Geometry / Motion Helpers
 # ---------------------------------------------------------------------------
 class PureOdometry:
+    """Simple planar odometry state used during navigation."""
+
     def __init__(self, initial_x=0.0, initial_y=0.0, initial_theta=0.0):
         self.x = initial_x
         self.y = initial_y
         self.theta = initial_theta
 
     def update(self, v, w, dt):
+        """Integrate one small motion step into the current pose estimate."""
         if dt <= 0: return
         self.x += v * dt * np.cos(self.theta)
         self.y += v * dt * np.sin(self.theta)
@@ -48,6 +70,14 @@ class PureOdometry:
         self.theta = (self.theta + np.pi) % (2 * np.pi) - np.pi
 
 class WallDetector:
+    """
+    Extract rough local wall points from the FPV image.
+
+    We use this as a lightweight geometric cue so the robot is not relying only
+    on image retrieval. The detector finds the sky / wall boundary and projects
+    those pixels into approximate robot-centric wall coordinates.
+    """
+
     def __init__(self, K, true_camera_height=0.21, wall_height=0.30, max_depth=0.3):
         self.K = K
         self.cam_h = true_camera_height 
@@ -59,6 +89,12 @@ class WallDetector:
         self.cy = K[1, 2]
 
     def extract_wall_points(self, fpv):
+        """
+        Return local wall points in robot coordinates.
+
+        Detect the first non-sky pixel in sampled image columns, then 
+        back-project it into a rough 2D wall point.
+        """
         h, w = fpv.shape[:2]
         gray = cv2.cvtColor(fpv, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -86,11 +122,17 @@ class WallDetector:
                     
         return all_local_points
 
+
 # ---------------------------------------------------------------------------
-# 2. VLAD Feature Extraction
+# VLAD Feature Extraction
 # ---------------------------------------------------------------------------
 class VLADExtractor:
-    """RootSIFT + VLAD with intra-normalization and power normalization."""
+    """
+    RootSIFT + VLAD descriptor pipeline.
+
+    This is the main visual matching block. It converts each exploration image
+    and each live frame into a compact descriptor so we can do fast place matching.
+    """
 
     def __init__(self, n_clusters: int = 128):
         self.n_clusters = n_clusters
@@ -100,14 +142,22 @@ class VLADExtractor:
 
     @property
     def dim(self) -> int:
+        """Return the final VLAD descriptor size."""
         return self.n_clusters * 128
 
     @staticmethod
     def _root_sift(des: np.ndarray) -> np.ndarray:
+        """Apply RootSIFT normalization on top of raw SIFT descriptors."""
         des = des / np.sum(des, axis=1, keepdims=True)
         return np.sqrt(des)
 
     def _des_to_vlad(self, des: np.ndarray) -> np.ndarray:
+        """
+        Aggregate local descriptors into one VLAD vector.
+
+        We use VLAD because it keeps matching compact while still preserving more
+        structure than using only one local descriptor or a raw nearest-neighbor setup.
+        """
         labels = self.codebook.predict(des)
         centers = self.codebook.cluster_centers_
         k = self.codebook.n_clusters
@@ -127,6 +177,12 @@ class VLADExtractor:
         return vlad
 
     def load_sift_cache(self, file_list: list[str], subsample_rate: int):
+        """
+        Load cached SIFT descriptors if available; otherwise extract and store them.
+
+        This keeps startup time practical, since recomputing SIFT over the whole
+        exploration set every run would be wasteful.
+        """
         cache_file = os.path.join(CACHE_DIR, f"sift_ss{subsample_rate}.pkl")
         if os.path.exists(cache_file):
             print(f"Loading cached SIFT from {cache_file}")
@@ -149,6 +205,12 @@ class VLADExtractor:
         print(f"  Saved {len(self._sift_cache)} descriptors -> {cache_file}")
 
     def build_vocabulary(self, file_list: list[str]):
+        """
+        Build or load the VLAD codebook.
+
+        The codebook is the visual vocabulary that lets us turn many local SIFT
+        features into one compact global descriptor per frame.
+        """
         cache_file = os.path.join(CACHE_DIR, f"codebook_k{self.n_clusters}.pkl")
         if os.path.exists(cache_file):
             print(f"Loading cached codebook from {cache_file}")
@@ -167,12 +229,14 @@ class VLADExtractor:
             pickle.dump(self.codebook, f)
 
     def extract(self, img: np.ndarray) -> np.ndarray:
+        """Extract one VLAD descriptor from a single image."""
         _, des = self.sift.detectAndCompute(img, None)
         if des is None or len(des) == 0:
             return np.zeros(self.dim)
         return self._des_to_vlad(self._root_sift(des))
 
     def extract_batch(self, file_list: list[str]) -> np.ndarray:
+        """Extract VLAD descriptors for the full exploration database."""
         vectors = []
         for fname in tqdm(file_list, desc="VLAD"):
             if fname in self._sift_cache and len(self._sift_cache[fname]) > 0:
@@ -182,29 +246,43 @@ class VLADExtractor:
         return np.array(vectors)
 
 # ---------------------------------------------------------------------------
-# 3. Player / Main Agent
+# Main Navigation Agent
 # ---------------------------------------------------------------------------
 class KeyboardPlayerPyGame(Player):
+    """
+    Main challenge-time navigation agent.
+
+    This class ties the whole online pipeline together:
+    visual matching, pose estimation, path planning, control, relocalization,
+    and the debugging / map views.
+    """
 
     def __init__(self, n_clusters: int = 128, subsample_rate: int = 5, top_k_shortcuts: int = 30):
         self.fpv = None
         self.last_act = Action.IDLE
         self.screen = None
         self.keymap = None
+
+        # The cleaned map produced by the offline stage is the geometric base for
+        # both path planning and wall-validity checks.
         self.occupancy_map = cv2.imread("cache/slam_map_walls_cleaned.png", cv2.IMREAD_GRAYSCALE)
         self.map_scale = 60.0 
         self.map_offset = 400 
 
-        # --- A* PATH VISUALIZATION STATE ---
+        # Core path-following state.
         self.global_path = []              # list of (world_x, world_y)
         self.goal_world_coords = None      # (gx, gy)
+        self.is_autonomous = False
+        self.lookahead_dist = 0.12
+        self.goal_reach_dist = 0.0125
+        self.path_replan_dist = 0.35
 
         super().__init__()
 
         self.subsample_rate = subsample_rate
         self.top_k_shortcuts = top_k_shortcuts
 
-        # Setup Camera Intrinsics and Wall Detector
+        # Camera model and wall detector used during live correction.
         CAMERA_W, CAMERA_H = 320, 240
         CAMERA_F = np.round(CAMERA_W / 2.0 / np.tan(np.deg2rad(60)))
         self.K = np.array([[CAMERA_F, 0, CAMERA_W / 2.0],
@@ -216,7 +294,8 @@ class KeyboardPlayerPyGame(Player):
         self.historic_h_walls = []
         self.MATCH_THRESHOLD = 0.15
 
-        # Load trajectory data
+        # Load the exploration trajectory and keep only pure single-action frames.
+        # We subsample them because we want a compact but still useful visual database.
         self.motion_frames = []
         self.file_list = []
         if os.path.exists(DATA_INFO_PATH):
@@ -236,7 +315,7 @@ class KeyboardPlayerPyGame(Player):
         self.G = None
         self.goal_node = None
 
-        # --- ODOMETRY & MAP STATE ---
+        # Runtime map / pose state.
         self.slam_map = None
         self.frame_poses = {}
         self.odom = None          
@@ -252,6 +331,7 @@ class KeyboardPlayerPyGame(Player):
             print("Warning: SLAM map/poses not found in cache. Run SLAM script first.")
 
     def reset(self):
+        """Reset runtime navigation state before a new attempt starts."""
         self.fpv = None
         self.last_act = Action.IDLE
         self.screen = None
@@ -261,6 +341,11 @@ class KeyboardPlayerPyGame(Player):
         self.historic_v_walls = []
         self.historic_h_walls = []
         self.global_path = []
+
+        # We default to autonomous mode because we want the runs to be
+        # fully automatic
+        self.is_autonomous = True
+
         pygame.init()
         self.keymap = {
             pygame.K_LEFT: Action.LEFT,
@@ -272,46 +357,78 @@ class KeyboardPlayerPyGame(Player):
         }
 
     def world_to_pixel(self, world_x, world_y):
+        """Convert metric world coordinates into map pixel coordinates."""
         px = int(self.map_offset + (world_x * self.map_scale))
         py = int(self.map_offset - (world_y * self.map_scale))
         return px, py
 
     def pixel_to_world(self, px, py):
+        """Convert map pixel coordinates back into world coordinates."""
         x = (px - self.map_offset) / self.map_scale
         y = (self.map_offset - py) / self.map_scale
         return x, y
 
     def plan_astar_path(self):
         """
-        Build one fixed geometric shortest path on the cleaned maze map
-        from the initial localized pose to the goal position.
+        Build the metric A* route from the current odometry pose to the goal.
+
+        The path is computed on the cleaned maze map, not on the raw retrieval graph.
+        That is important because we want a physically safe route through free space,
+        not just a chain of visually similar frames.
         """
         if self.odom is None or self.goal_world_coords is None or self.occupancy_map is None:
             self.global_path = []
             return
 
+        # Convert the current robot pose and goal pose from world coordinates into
+        # map pixels, because the search is done directly on the map image grid.
         start_px, start_py = self.world_to_pixel(self.odom.x, self.odom.y)
         goal_px, goal_py = self.world_to_pixel(self.goal_world_coords[0], self.goal_world_coords[1])
 
-        # Inflate walls slightly in memory so the visualized path stays centered
-        kernel = np.ones((7, 7), np.uint8)
-        safe_map = cv2.erode(self.occupancy_map, kernel, iterations=1)
-        h, w = safe_map.shape
+        # Convert the cleaned map into a binary free-space mask.
+        free_mask = np.zeros_like(self.occupancy_map, dtype=np.uint8)
+        free_mask[self.occupancy_map > 150] = 255
 
+        # Add a bit more wall margin so the path sits away from walls.
+        # This is a small safety margin so the path does not hug walls too tightly.
+        kernel = np.ones((5, 5), np.uint8)
+        free_mask = cv2.erode(free_mask, kernel, iterations=1)
+
+        # Distance-to-wall map: larger values = safer / more centered.
+        clearance = cv2.distanceTransform(free_mask, cv2.DIST_L2, 5)
+
+        h, w = free_mask.shape
+
+        # Standard A* bookkeeping:
+        # - open_set stores frontier nodes ordered by priority.
+        # - came_from stores the parent of each visited node for path reconstruction.
+        # - g_score stores the best known path cost to each node.
         open_set = []
         heapq.heappush(open_set, (0, start_px, start_py))
         came_from = {}
         g_score = {(start_px, start_py): 0.0}
 
         def heuristic(a, b):
+            """
+            Manhattan-distance heuristic for A*.
+
+            We use this because our search only moves in the 4 cardinal directions.
+            So Manhattan distance is a natural and cheap estimate of how far a cell is
+            from the goal.
+            """
             return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
-        directions = [(0,1),(0,-1),(1,0),(-1,0),(1,1),(-1,-1),(1,-1),(-1,1)]
+        # We keep the search 4-connected instead of diagonal.
+        # That matches the maze geometry better and avoids unrealistic corner cutting.
+        directions = [(0,1),(0,-1),(1,0),(-1,0)]
         path_found = False
 
         while open_set:
             _, curr_x, curr_y = heapq.heappop(open_set)
 
+            # We allow a tiny pixel tolerance near the goal.
+            # After erosion, the exact goal pixel may not always be the exact pixel we
+            # end on, so this makes the search a little more robust.
             if heuristic((curr_x, curr_y), (goal_px, goal_py)) < 3:
                 goal_px, goal_py = curr_x, curr_y
                 path_found = True
@@ -319,9 +436,17 @@ class KeyboardPlayerPyGame(Player):
 
             for dx, dy in directions:
                 nx_, ny_ = curr_x + dx, curr_y + dy
-                if 0 <= nx_ < w and 0 <= ny_ < h and safe_map[ny_, nx_] > 50:
-                    step_cost = 1.414 if dx != 0 and dy != 0 else 1.0
+                # Only expand neighbors that stay inside the image and lie in free space.
+                if 0 <= nx_ < w and 0 <= ny_ < h and free_mask[ny_, nx_] > 0:
+                    # Base step cost is 1 per grid move.
+                    # Then we add a wall penalty so cells near walls become more expensive.
+                    # This makes the final route naturally prefer the center of corridors.
+                    wall_penalty = 10.0 / max(clearance[ny_, nx_], 1.0)
+                    step_cost = 1.0 + wall_penalty
                     tentative_g = g_score[(curr_x, curr_y)] + step_cost
+
+                    # Standard A* relaxation: keep this neighbor only if we found a
+                    # cheaper way to reach it than before.
                     if (nx_, ny_) not in g_score or tentative_g < g_score[(nx_, ny_)]:
                         g_score[(nx_, ny_)] = tentative_g
                         priority = tentative_g + heuristic((goal_px, goal_py), (nx_, ny_))
@@ -332,33 +457,195 @@ class KeyboardPlayerPyGame(Player):
             self.global_path = []
             return
 
+        # Reconstruct the path by backtracking from the final goal pixel through the
+        # parent links stored in came_from.
         curr = (goal_px, goal_py)
         path_pixels = []
         while curr in came_from:
             path_pixels.append(curr)
             curr = came_from[curr]
+            
         path_pixels.reverse()
 
-         # Light subsampling keeps the displayed fixed path cleaner
-        self.global_path = [self.pixel_to_world(px, py) for (px, py) in path_pixels[::3]]
+        # Mild sparsification keeps the overall route the same, but removes a lot of
+        # tiny pixel-by-pixel jitter. That makes the downstream controller smoother
+        # and usually faster without changing the actual maze route.
+        if len(path_pixels) > 1:
+            sparse = path_pixels[::4]
+            if sparse[-1] != path_pixels[-1]:
+                sparse.append(path_pixels[-1])
+            path_pixels = sparse
+
+        # Store the final path back in world coordinates because the controller and
+        # odometry run in metric space, not image-pixel space.
+        self.global_path = [self.pixel_to_world(px, py) for (px, py) in path_pixels]
+
+    def _wrap_angle(self, angle):
+        """Wrap angle to [-pi, pi] for stable heading comparisons."""
+        return (angle + np.pi) % (2 * np.pi) - np.pi
+
+    def _distance_to_path(self):
+        """Return the current robot-to-path distance in world coordinates."""
+        if self.odom is None or not self.global_path:
+            return np.inf
+        robot = np.array([self.odom.x, self.odom.y], dtype=np.float32)
+        return min(np.linalg.norm(np.array(p, dtype=np.float32) - robot) for p in self.global_path)
+
+    def _is_forward_safe(self, samples=6, step_dt=0.01):
+        """
+        Roll out a short forward motion on the map and reject it if it enters a wall.
+
+        This is the small safety check that lets the controller stay simple while still
+        respecting the occupancy map.
+        """
+        if self.odom is None:
+            return False
+
+        test_x = self.odom.x
+        test_y = self.odom.y
+        step = 2.9462 * step_dt
+
+        for _ in range(samples):
+            test_x += step * np.cos(self.odom.theta)
+            test_y += step * np.sin(self.odom.theta)
+            if not self.is_state_valid(test_x, test_y):
+                return False
+        return True
+
+    def get_autonomous_action(self):
+        """
+        Core path-following controller.
+
+        The controller is intentionally simple:
+        it tracks the current A* path, turns toward the next useful point, checks if
+        a forward rollout is safe, and replans if the pose drifts too far away.
+        """
+        if self.odom is None or self.goal_world_coords is None:
+            return Action.IDLE
+
+        # If no path is currently stored, build one from the latest pose estimate.
+        if not self.global_path:
+            self.plan_astar_path()
+            if not self.global_path:
+                return Action.IDLE
+
+        robot = np.array([self.odom.x, self.odom.y], dtype=np.float32)
+        goal = np.array(self.goal_world_coords, dtype=np.float32)
+
+        # 1. true metric distance to the goal, and
+        # 2. distance to the last point of the current A* path.
+        #
+        # The second one helps because the path endpoint can sometimes be a slightly
+        # more stable stopping reference than the raw goal point itself.
+        goal_dist = np.linalg.norm(goal - robot)
+
+        path_end_dist = np.inf
+        if self.global_path:
+            path_end = np.array(self.global_path[-1], dtype=np.float32)
+            path_end_dist = np.linalg.norm(path_end - robot)
+
+        # Either being at the actual goal or effectively at the final path endpoint is
+        # treated as good enough for check-in.
+        if goal_dist < self.goal_reach_dist or path_end_dist < 0.035:
+            print(f"[AUTO] Goal reached. CHECKIN. goal_dist={goal_dist:.3f}, path_end_dist={path_end_dist:.3f}")
+            self.is_autonomous = False
+            return Action.CHECKIN
+
+        # If visual relocalization or drift has pulled the pose too far away from the
+        # current route, rebuild the path from the new pose instead of stubbornly
+        # following an outdated one.
+        if self._distance_to_path() > self.path_replan_dist:
+            self.plan_astar_path()
+            if not self.global_path:
+                return Action.IDLE
+
+        # Prune waypoints we have already reached
+        while len(self.global_path) > 1:
+            wp0 = np.array(self.global_path[0], dtype=np.float32)
+            if np.linalg.norm(wp0 - robot) < 0.08:
+                self.global_path.pop(0)
+            else:
+                break
+
+        # Near the goal, it is cleaner to drive directly toward the goal point.
+        # Farther away, we use the path itself and sometimes look one point ahead
+        # so the robot does not get stuck making tiny turns at every small waypoint.
+        if goal_dist < 0.08:
+            target_pt = goal
+        elif len(self.global_path) > 1 and np.linalg.norm(np.array(self.global_path[0], dtype=np.float32) - robot) < 0.12:
+            target_pt = np.array(self.global_path[1], dtype=np.float32)
+        else:
+            target_pt = np.array(self.global_path[0], dtype=np.float32)
+
+        dx = float(target_pt[0] - self.odom.x)
+        dy = float(target_pt[1] - self.odom.y)
+        target_heading = np.arctan2(dy, dx)
+        heading_error = self._wrap_angle(target_heading - self.odom.theta)
+
+        # Turn tolerance controls how precisely we force heading alignment before
+        # moving forward.
+        #
+        # Near the goal we use a tighter tolerance for better final accuracy.
+        # Away from the goal we use a looser tolerance so the robot can follow the
+        # route more fluidly instead of over-rotating at every small bend.
+        if goal_dist < 0.08:
+            TURN_TOL = np.deg2rad(4)
+        else:
+            TURN_TOL = np.deg2rad(10)
+
+        # Before committing to forward motion, do a short rollout on the map.
+        # If that rollout would hit a wall, rotate first instead of pushing forward.
+        if not self._is_forward_safe(samples=5, step_dt=0.01):
+            return Action.LEFT if heading_error >= 0 else Action.RIGHT
+
+        # Turn in place until reasonably aligned to the next path segment
+        if heading_error > TURN_TOL:
+            return Action.LEFT
+        elif heading_error < -TURN_TOL:
+            return Action.RIGHT
+        else:
+            return Action.FORWARD
 
     def act(self):
+        """
+        Handle keyboard events and switch between manual and autonomous control.
+
+        Manual key presses immediately disable auto mode. Pressing A toggles auto mode.
+        """
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit()
                 self.last_act = Action.QUIT
                 return Action.QUIT
             if event.type == pygame.KEYDOWN:
-                if event.key in self.keymap:
+                if event.key == pygame.K_a:
+                    self.is_autonomous = not self.is_autonomous
+                    self.last_act = Action.IDLE
+                    print(f"[AUTO] {'ON' if self.is_autonomous else 'OFF'}")
+                    if self.is_autonomous and self.odom is not None:
+                        self.plan_astar_path()
+                elif event.key in self.keymap:
+                    self.is_autonomous = False
                     self.last_act |= self.keymap[event.key]
                 else:
                     self.show_target_images()
             if event.type == pygame.KEYUP:
                 if event.key in self.keymap:
                     self.last_act ^= self.keymap[event.key]
+
+        if self.is_autonomous:
+            self.last_act = self.get_autonomous_action()
+
         return self.last_act
 
     def see(self, fpv):
+        """
+        Main perception / update loop during navigation.
+
+        This is where the online pipeline actually runs:
+        startup localization, odometry integration, local geometric correction,
+        periodic visual relocalization, and visualization updates.
+        """
         if fpv is None or len(fpv.shape) < 3:
             return
         self.fpv = fpv
@@ -372,7 +659,12 @@ class KeyboardPlayerPyGame(Player):
 
         if self._state and self._state[1] == Phase.NAVIGATION:
             
-            # --- 1. GLOBAL LOCALIZATION (Runs only once at start) ---
+            # -------------------------------------------------------------------
+            # 1. Global localization at the start of navigation
+            # -------------------------------------------------------------------
+            # We only do this once. The first live frame is matched against the
+            # exploration database, and the matched frame pose becomes our initial
+            # metric pose in the map.
             if self.odom is None:
                 feat = self.extractor.extract(self.fpv)
                 best_idx = int(np.argmax(self.database @ feat))
@@ -383,6 +675,7 @@ class KeyboardPlayerPyGame(Player):
                     self.odom = PureOdometry(wx, wy, wtheta)
                     print(f"\n[!] VLAD Initialized Position: X={wx:.2f}, Y={wy:.2f}, Theta={np.rad2deg(wtheta):.0f}deg")
                 else:
+                    # Fallback only in case pose lookup fails.
                     self.odom = PureOdometry(0.0, 0.0, 0.0)
                 self.last_time = current_time
 
@@ -390,13 +683,17 @@ class KeyboardPlayerPyGame(Player):
                 if self.goal_world_coords is not None and not self.global_path:
                     self.plan_astar_path() 
 
-            # --- 2. KINEMATIC INTEGRATION (Runs every frame) ---
+            # ---------------------------------------------------------------
+            # 2. Kinematic integration from the previous action.
+            # ---------------------------------------------------------------
             elif self.last_time is not None:
                 dt = 0.01 
                 v, w = 0.0, 0.0
                 base_v = 2.9462
                 base_w = 4.27 
                 
+                # Reconstruct the commanded linear / angular motion from the
+                # last discrete action.
                 is_back = bool(self.last_act & Action.BACKWARD)
                 if self.last_act & Action.FORWARD: v += base_v
                 if is_back: v -= base_v
@@ -406,16 +703,28 @@ class KeyboardPlayerPyGame(Player):
                 next_x = self.odom.x + v * dt * np.cos(self.odom.theta)
                 next_y = self.odom.y + v * dt * np.sin(self.odom.theta)
                 
-                # Check X and Y independently to allow "sliding" against walls
-                if self.is_state_valid(next_x, self.odom.y):
-                    self.odom.x = next_x
-                if self.is_state_valid(self.odom.x, next_y):
-                    self.odom.y = next_y
-
+                # In auto mode we force the full step to be valid before moving.
+                # This avoids the robot "sliding" into walls one axis at a time.
+                if self.is_autonomous and abs(v) > 0:
+                    if self.is_state_valid(next_x, next_y):
+                        self.odom.x = next_x
+                        self.odom.y = next_y
+                else:
+                    # Manual mode keeps the older sliding behavior so the user
+                    # still has direct interactive control.
+                    if self.is_state_valid(next_x, self.odom.y):
+                        self.odom.x = next_x
+                    if self.is_state_valid(self.odom.x, next_y):
+                        self.odom.y = next_y
                 self.odom.theta += w * dt
                 self.odom.theta = (self.odom.theta + np.pi) % (2 * np.pi) - np.pi
 
-            # --- 3. GEOMETRIC LOCAL CORRECTION (Throttled to every 2nd frame) ---
+            # ---------------------------------------------------------------
+            # 3. Local geometric correction from wall structure.
+            # ---------------------------------------------------------------
+            # Every few frames, use the wall detector to estimate the dominant wall
+            # direction and softly pull the heading back toward the nearest Manhattan
+            # orientation. This keeps the pose from slowly rotating away from the maze.
             if self.frame_count % 2 == 0 and self.odom is not None:
                 all_local = self.wall_detector.extract_wall_points(self.fpv)
                 
@@ -430,6 +739,7 @@ class KeyboardPlayerPyGame(Player):
                     dominant_bin = np.argmax(hist)
                     dominant_local_angle = (bin_edges[dominant_bin] + bin_edges[dominant_bin+1]) / 2.0
                     
+                    # Keep only wall segments that agree with the dominant local direction.
                     angle_diffs = np.abs(np.arctan2(np.sin(local_angles - dominant_local_angle), 
                                                     np.cos(local_angles - dominant_local_angle)))
                     inlier_mask_segments = angle_diffs < np.deg2rad(15)
@@ -440,51 +750,62 @@ class KeyboardPlayerPyGame(Player):
                             np.mean(np.cos(local_angles[inlier_mask_segments]))
                         )
                         
-                        # Soft Heading correction based on Manhattan World
+                        # Estimate the dominant wall angle in global coordinates,
+                        # then snap that angle to the nearest Manhattan direction.
                         global_wall_angle = self.odom.theta + precise_local_angle
                         target_global_angle = np.round(global_wall_angle / (np.pi/2.0)) * (np.pi/2.0)
                         heading_error = target_global_angle - global_wall_angle
                         
+                        # Soft heading correction only. This keeps the correction stable
+                        # and avoids sudden jumps.
                         self.odom.theta += heading_error * 0.15 
                         self.odom.theta = (self.odom.theta + np.pi) % (2 * np.pi) - np.pi
                         
-                        # Soft Translation correction
-                        inlier_mask_pts = np.append(inlier_mask_segments, [False]*step_size)
-                        valid_local_pts = pts[inlier_mask_pts]
-                        
-                        if len(valid_local_pts) > 0:
-                            global_X = self.odom.x + (valid_local_pts[:, 0] * np.cos(self.odom.theta) - valid_local_pts[:, 1] * np.sin(self.odom.theta))
-                            global_Y = self.odom.y + (valid_local_pts[:, 0] * np.sin(self.odom.theta) + valid_local_pts[:, 1] * np.cos(self.odom.theta))
+                        # In manual mode only, also allow gentle x/y correction based on
+                        # recurring wall locations. In auto mode we avoid this because it
+                        # can make the map marker move while the real robot is actually stuck.
+                        if not self.is_autonomous:
+                            inlier_mask_pts = np.append(inlier_mask_segments, [False]*step_size)
+                            valid_local_pts = pts[inlier_mask_pts]
                             
-                            mean_wall_x = np.mean(global_X)
-                            mean_wall_y = np.mean(global_Y)
-                            
-                            norm_target = (target_global_angle + np.pi) % (2 * np.pi) - np.pi
-                            is_horizontal = np.isclose(abs(norm_target), 0.0, atol=0.1) or np.isclose(abs(norm_target), np.pi, atol=0.1)
-                            is_vertical = np.isclose(abs(norm_target), np.pi/2.0, atol=0.1)
-                            translation_gain = 0.1 
+                            if len(valid_local_pts) > 0:
+                                global_X = self.odom.x + (valid_local_pts[:, 0] * np.cos(self.odom.theta) - valid_local_pts[:, 1] * np.sin(self.odom.theta))
+                                global_Y = self.odom.y + (valid_local_pts[:, 0] * np.sin(self.odom.theta) + valid_local_pts[:, 1] * np.cos(self.odom.theta))
+                                
+                                mean_wall_x = np.mean(global_X)
+                                mean_wall_y = np.mean(global_Y)
+                                
+                                norm_target = (target_global_angle + np.pi) % (2 * np.pi) - np.pi
+                                is_horizontal = np.isclose(abs(norm_target), 0.0, atol=0.1) or np.isclose(abs(norm_target), np.pi, atol=0.1)
+                                is_vertical = np.isclose(abs(norm_target), np.pi/2.0, atol=0.1)
+                                translation_gain = 0.1 
 
-                            if is_horizontal:
-                                if not self.historic_h_walls:
-                                    self.historic_h_walls.append(mean_wall_y)
-                                else:
-                                    closest_y = min(self.historic_h_walls, key=lambda y: abs(y - mean_wall_y))
-                                    if abs(closest_y - mean_wall_y) < self.MATCH_THRESHOLD:
-                                        self.odom.y += (closest_y - mean_wall_y) * translation_gain
-                                    else:
+                                if is_horizontal:
+                                    if not self.historic_h_walls:
                                         self.historic_h_walls.append(mean_wall_y)
-                                        
-                            elif is_vertical:
-                                if not self.historic_v_walls:
-                                    self.historic_v_walls.append(mean_wall_x)
-                                else:
-                                    closest_x = min(self.historic_v_walls, key=lambda x: abs(x - mean_wall_x))
-                                    if abs(closest_x - mean_wall_x) < self.MATCH_THRESHOLD:
-                                        self.odom.x += (closest_x - mean_wall_x) * translation_gain
                                     else:
+                                        closest_y = min(self.historic_h_walls, key=lambda y: abs(y - mean_wall_y))
+                                        if abs(closest_y - mean_wall_y) < self.MATCH_THRESHOLD:
+                                            self.odom.y += (closest_y - mean_wall_y) * translation_gain
+                                        else:
+                                            self.historic_h_walls.append(mean_wall_y)
+                                            
+                                elif is_vertical:
+                                    if not self.historic_v_walls:
                                         self.historic_v_walls.append(mean_wall_x)
+                                    else:
+                                        closest_x = min(self.historic_v_walls, key=lambda x: abs(x - mean_wall_x))
+                                        if abs(closest_x - mean_wall_x) < self.MATCH_THRESHOLD:
+                                            self.odom.x += (closest_x - mean_wall_x) * translation_gain
+                                        else:
+                                            self.historic_v_walls.append(mean_wall_x)
 
-            # --- 4. VLAD GLOBAL RELOCALIZATION & UI (Throttled to every 4th frame) ---
+            # ---------------------------------------------------------------
+            # 4. Periodic VLAD relocalization.
+            # ---------------------------------------------------------------
+            # Every few frames, re-match the live frame against the exploration
+            # database and softly pull the pose toward the best visual match.
+            # This helps correct drift that odometry alone cannot handle.
             if self.frame_count % 4 == 0 and self.odom is not None and self.slam_map is not None:
                 feat = self.extractor.extract(self.fpv)
                 sims = self.database @ feat
@@ -496,26 +817,31 @@ class KeyboardPlayerPyGame(Player):
                     if best_file in self.frame_poses:
                         mx, my, mtheta = self.frame_poses[best_file]
                         alpha = 0.15
-                        
-                        self.odom.x = (1 - alpha) * self.odom.x + alpha * mx
-                        self.odom.y = (1 - alpha) * self.odom.y + alpha * my
+
+                        # Again, x/y pull is manual-only. In auto mode we only trust
+                        # the heading update here, which is safer for challenge runs.
+                        if not self.is_autonomous:
+                            self.odom.x = (1 - alpha) * self.odom.x + alpha * mx
+                            self.odom.y = (1 - alpha) * self.odom.y + alpha * my
                         
                         diff = (mtheta - self.odom.theta + np.pi) % (2 * np.pi) - np.pi
                         self.odom.theta += alpha * diff
                         self.odom.theta = (self.odom.theta + np.pi) % (2 * np.pi) - np.pi
 
+                # Debug panels
                 keys = pygame.key.get_pressed()
                 if keys[pygame.K_q]:
                     self.display_next_best_view()
                 self.display_global_map()
 
-        # Update live camera stream every frame
+        # Always refresh the live FPV display, even if we are not currently navigating.
         rgb = fpv[:, :, ::-1]
         surface = pygame.image.frombuffer(rgb.tobytes(), rgb.shape[1::-1], 'RGB')
         self.screen.blit(surface, (0, 0))
         pygame.display.update()
 
     def is_state_valid(self, x, y):
+        """Check whether a world-coordinate point lies in free space on the cleaned map."""
         if self.occupancy_map is None: 
             return True # Failsafe if map isn't loaded
             
@@ -532,16 +858,19 @@ class KeyboardPlayerPyGame(Player):
     # Setup and Visualizer Methods
     # -----------------------------------------------------------------------
     def set_target_images(self, images):
+        """Store the target views and open the target image window."""
         super().set_target_images(images)
         self.show_target_images()
 
     def pre_navigation(self):
+        """Build the visual database, the retrieval graph, and the goal estimate before navigation starts."""
         super().pre_navigation()
         self._build_database()
         self._build_graph()
         self._setup_goal()
 
     def _build_database(self):
+        """Load / build the full VLAD database over the exploration images."""
         if self.database is not None:
             return
         self.extractor.load_sift_cache(self.file_list, self.subsample_rate)
@@ -549,6 +878,7 @@ class KeyboardPlayerPyGame(Player):
         self.database = self.extractor.extract_batch(self.file_list)
 
     def _build_graph(self):
+        """Build the temporal + visual shortcut graph used for retrieval-side reasoning and debugging."""
         if self.G is not None: return
         n = len(self.database)
         self.G = nx.DiGraph() 
@@ -578,34 +908,71 @@ class KeyboardPlayerPyGame(Player):
             self.G.add_edge(i, j, weight=VISUAL_WEIGHT_BASE + VISUAL_WEIGHT_SCALE * d, edge_type="visual")
 
     def _setup_goal(self):
-        if self.goal_node is not None: return
-        targets = self.get_target_images()
-        if not targets: return
-        sims = self.database @ self.extractor.extract(targets[0])
-        self.goal_node = int(np.argmax(sims))
+        """Estimate the goal node by matching the target images against the exploration database."""
+        if self.goal_node is not None:
+            return
 
-        # Save physical goal coordinates for A* path visualization
+        targets = self.get_target_images()
+        if not targets:
+            return
+
+        n = len(self.database)
+        agg = np.zeros(n, dtype=np.float32)
+
+        valid_count = 0
+        for t in targets:
+            if t is None:
+                continue
+            feat = self.extractor.extract(t)
+            if np.linalg.norm(feat) == 0:
+                continue
+
+            sims = self.database @ feat
+            agg += sims
+            valid_count += 1
+
+        if valid_count == 0:
+            return
+
+        agg /= valid_count
+
+        # small 1D smoothing so one isolated false match does not win
+        smooth = agg.copy()
+        for i in range(1, n - 1):
+            smooth[i] = 0.25 * agg[i - 1] + 0.5 * agg[i] + 0.25 * agg[i + 1]
+
+        self.goal_node = int(np.argmax(smooth))
+
         goal_file = self.file_list[self.goal_node]
         if goal_file in self.frame_poses:
             gx, gy, _ = self.frame_poses[goal_file]
             self.goal_world_coords = (gx, gy)
 
+        topk = np.argsort(-smooth)[:5]
+        print("\nTop goal candidates:")
+        for rank, idx in enumerate(topk, 1):
+            print(rank, idx, self.file_list[idx], float(smooth[idx]))
+
     def _load_img(self, idx: int) -> np.ndarray | None:
+        """Load an exploration image by node index."""
         if 0 <= idx < len(self.file_list):
             return cv2.imread(os.path.join(IMAGE_DIR, self.file_list[idx]))
         return None
 
     def _get_current_node(self) -> int:
+        """Return the best-matching exploration node for the current FPV frame."""
         feat = self.extractor.extract(self.fpv)
         return int(np.argmax(self.database @ feat))
 
     def _get_path(self, start: int) -> list[int]:
+        """Return a shortest path on the retrieval graph from the current node to the goal node."""
         try:
             return nx.shortest_path(self.G, start, self.goal_node, weight="weight")
         except nx.NetworkXNoPath:
             return [start]
 
     def _edge_action(self, a: int, b: int) -> str:
+        """Translate a temporal graph edge into a forward/back/left/right label for the debug panel."""
         REVERSE = {'FORWARD': 'BACKWARD', 'BACKWARD': 'FORWARD', 'LEFT': 'RIGHT', 'RIGHT': 'LEFT'}
         if b == a + 1 and a < len(self.motion_frames):
             return self.motion_frames[a]['action']
@@ -614,6 +981,7 @@ class KeyboardPlayerPyGame(Player):
         return '?'
 
     def show_target_images(self):
+        """Display the four target views in one window for quick reference."""
         targets = self.get_target_images()
         if not targets: return
         top = cv2.hconcat(targets[:2])
@@ -630,6 +998,7 @@ class KeyboardPlayerPyGame(Player):
         cv2.waitKey(1)
 
     def display_global_map(self):
+        """Show the global metric map with the current pose, target, and A* path."""
         if self.slam_map is None or self.goal_node is None: return
         display_map = self.slam_map.copy()
 
@@ -657,13 +1026,18 @@ class KeyboardPlayerPyGame(Player):
             hy = int(rpy - 15 * np.sin(self.odom.theta))
             cv2.line(display_map, (rpx, rpy), (hx, hy), (0, 255, 0), 2)
 
+        mode_txt = "AUTO" if self.is_autonomous else "MANUAL"
+        mode_col = (0, 255, 0) if self.is_autonomous else (0, 0, 255)
         cv2.putText(display_map, "A* PATH", (20, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 200, 0), 2, cv2.LINE_AA)
+        cv2.putText(display_map, mode_txt, (20, 65),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, mode_col, 2, cv2.LINE_AA)
 
         cv2.imshow("Global Metric Map (Live Odometry + Constraints)", display_map)
         cv2.waitKey(1)
 
     def display_next_best_view(self):
+        """Show a richer retrieval-side debug panel with the current best node and next likely graph steps."""
         ACT = {'FORWARD': 'FWD', 'BACKWARD': 'BACK', 'LEFT': 'LEFT', 'RIGHT': 'RIGHT'}
         FONT = cv2.FONT_HERSHEY_SIMPLEX
         AA = cv2.LINE_AA
@@ -754,6 +1128,7 @@ class KeyboardPlayerPyGame(Player):
         cv2.waitKey(1)
 
 if __name__ == "__main__":
+    """Run the navigation player directly with command-line configuration options."""
     import argparse
     import vis_nav_game
 
