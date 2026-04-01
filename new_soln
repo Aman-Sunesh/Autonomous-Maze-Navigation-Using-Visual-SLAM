@@ -669,13 +669,13 @@ class KeyboardPlayerPyGame(Player):
 
         # Turn in place until reasonably aligned to the next path segment
         if heading_error > TURN_TOL:
-            self.frame_count += 5
+            self.frame_count += 1
             return Action.LEFT
         elif heading_error < -TURN_TOL:
-            self.frame_count += 5
+            self.frame_count += 1
             return Action.RIGHT
         else:
-            self.frame_count += 1
+            self.frame_count += 5
             return Action.FORWARD
 
     def act(self):
@@ -892,7 +892,7 @@ class KeyboardPlayerPyGame(Player):
                                 #     if abs(error_x) < (GRID_SIZE / 2.0):
                                 #         self.odom.x += error_x * translation_gain
 
-                self.display_global_map()
+                # self.display_global_map()
 
         # Always refresh the live FPV display, even if we are not currently navigating.
         rgb = fpv[:, :, ::-1]
