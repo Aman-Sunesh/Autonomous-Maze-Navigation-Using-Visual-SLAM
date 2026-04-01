@@ -22,6 +22,7 @@ import cv2
 import numpy as np
 import os
 import math
+import re
 
 # ---------------------------------------------------------------------------
 # Geometry Helpers
@@ -51,13 +52,45 @@ def segments_intersect(A, B, C, D):
     """
     return ccw(A, C, D) != ccw(B, C, D) and ccw(A, B, C) != ccw(A, B, D)
 
+def natural_sort_key(s):
+    """
+    Splits a string into text and integer components for sorting (e.g., img2 comes before img10).
+    """
+    return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
+
+def get_occupied_length(points, start_val, end_val, radius=0.01):
+    """
+    Treats each point as a 1D circle (interval) of size `radius`. 
+    Merges overlapping intervals to find the true continuous length occupied.
+    """
+    intervals = []
+    for p in points:
+        i_start = max(start_val, p - radius)
+        i_end = min(end_val, p + radius)
+        if i_start < i_end:
+            intervals.append([i_start, i_end])
+            
+    if not intervals:
+        return 0.0
+        
+    intervals.sort(key=lambda x: x[0])
+    merged = [intervals[0]]
+    
+    for current in intervals[1:]:
+        last = merged[-1]
+        if current[0] <= last[1]:
+            last[1] = max(last[1], current[1]) # Merge overlapping points
+        else:
+            merged.append(current)
+            
+    return sum([m[1] - m[0] for m in merged])
 
 # ---------------------------------------------------------------------------
 # Main Cleanup / Visualization Routine
 # ---------------------------------------------------------------------------
-def visualize_map_with_trajectory(walls_path="cache/slam_walls_realtime_cleaned.json", 
+def visualize_map_with_trajectory(walls_path="cache/slam_walls.json", 
                                   poses_path="cache/frame_poses.json", 
-                                  map_size=800, scale=60.0, threshold=0.6):
+                                  map_size=800, scale=60.0, coverage_threshold=0.3):
     """
     Build a final cleaned map image from raw SLAM wall points and frame poses.
 
@@ -75,13 +108,12 @@ def visualize_map_with_trajectory(walls_path="cache/slam_walls_realtime_cleaned.
             (x, y, theta) across the exploration trajectory.
         map_size (int): Output map image size in pixels.
         scale (float): Conversion factor from world meters to image pixels.
-        threshold (float): Minimum fraction of occupied mini-bins needed to keep a
-            wall segment as valid.
+        coverage_threshold (float): Minimum fraction of occupied length needed 
+            to keep a wall segment as valid.
 
     Returns:
         None. The function saves the final map image to cache and displays it.
     """
-
 
     # We cannot build the cleaned map unless both the wall data and pose data exist.
     # If either file is missing, the SLAM stage probably has not been run yet.
@@ -101,23 +133,16 @@ def visualize_map_with_trajectory(walls_path="cache/slam_walls_realtime_cleaned.
     # -----------------------------------------------------------------------
     # Grid / binning parameters
     # -----------------------------------------------------------------------
-    # The maze is assumed to live on a 0.4m grid with walls centered at offsets
-    # of +0.2m. We use these constants to snap noisy wall points back onto the
-    # intended maze structure.
-    grid_size = 0.4      
-    offset = 0.2  
-
-    # Each candidate 0.4m wall segment is subdivided into many tiny bins.
-    # A wall is kept only if enough of those bins received evidence from the raw
-    # wall points. This avoids keeping segments created by only a few noisy points.       
-    num_bins = 10 
-    bin_size = grid_size / num_bins 
+    # The maze is assumed to live on a 0.4m grid. We use these constants to snap 
+    # noisy wall points back onto the intended maze structure.
+    grid_size = 0.1
+    eps = 0.01          # margin of error of the position of the wall point
+    point_radius = 0.01 # radius of the point
 
     # Dictionaries used to group noisy wall points into vertical and horizontal
     # candidate wall segments.
-    v_lines = {} 
-    h_lines = {} 
-
+    v_segments = {}
+    h_segments = {}
 
     # -----------------------------------------------------------------------
     # Group noisy points into grid-aligned wall candidates
@@ -125,65 +150,63 @@ def visualize_map_with_trajectory(walls_path="cache/slam_walls_realtime_cleaned.
     # For each wall point, we determine whether it is closer to a vertical or a
     # horizontal maze wall, then assign it to the corresponding 0.4m segment.
     for wx, wy in surviving_walls:
-        # Snap the point to the nearest grid-aligned vertical / horizontal wall line.
-        snapped_x = round((wx - offset) / grid_size) * grid_size + offset
-        snapped_y = round((wy - offset) / grid_size) * grid_size + offset
-
+        x_rem = abs(wx % grid_size)
+        is_v = x_rem < eps or abs(x_rem - grid_size) < eps
+        
+        y_rem = abs(wy % grid_size)
+        is_h = y_rem < eps or abs(y_rem - grid_size) < eps
+        
         # If the point is closer to a vertical wall, group it into a vertical segment.
-        if abs(wx - snapped_x) < abs(wy - snapped_y):
-            y_start = math.floor((wy - offset) / grid_size) * grid_size + offset
-            key = (round(snapped_x, 3), round(y_start, 3))
-            if key not in v_lines: v_lines[key] = []
-            v_lines[key].append(wy)
-
+        if is_v:
+            x_line = round(wx / grid_size) * grid_size
+            y_start = math.floor((wy + eps) / grid_size) * grid_size
+            key = (round(x_line, 3), round(y_start, 3))
+            if key not in v_segments: v_segments[key] = []
+            v_segments[key].append(wy)
+            
         # Otherwise, group it into a horizontal segment.
-        else:
-            x_start = math.floor((wx - offset) / grid_size) * grid_size + offset
-            key = (round(snapped_y, 3), round(x_start, 3))
-            if key not in h_lines: h_lines[key] = []
-            h_lines[key].append(wx)
+        if is_h:
+            y_line = round(wy / grid_size) * grid_size
+            x_start = math.floor((wx + eps) / grid_size) * grid_size
+            key = (round(x_start, 3), round(y_line, 3))
+            if key not in h_segments: h_segments[key] = []
+            h_segments[key].append(wx)
 
     valid_segments = []
 
     # -----------------------------------------------------------------------
     # Keep only well-supported vertical segments
     # -----------------------------------------------------------------------
-    # Each candidate segment is divided into mini-bins. If enough mini-bins contain
-    # observed wall points, the segment is treated as a real wall.
-    for (x_line, y_start), y_vals in v_lines.items():
-        hit_bins = set()
-        for y in y_vals:
-            bin_idx = int((y - y_start) / bin_size)
-            if 0 <= bin_idx < num_bins: hit_bins.add(bin_idx)
-
+    # Each candidate segment is checked for continuous length coverage. 
+    # A wall is kept only if enough of its length received evidence from the raw points.
+    for (x_line, y_start), y_vals in v_segments.items():
+        occupied_len = get_occupied_length(y_vals, y_start, y_start + grid_size, point_radius)
+        
         # Only accept the segment if the observed support is strong enough.
-        if (len(hit_bins) / float(num_bins)) >= threshold:
+        if (occupied_len / grid_size) >= coverage_threshold:
             valid_segments.append(((x_line, y_start), (x_line, y_start + grid_size)))
-
 
     # -----------------------------------------------------------------------
     # Keep only well-supported horizontal segments
     # -----------------------------------------------------------------------
-    for (y_line, x_start), x_vals in h_lines.items():
-        hit_bins = set()
-        for x in x_vals:
-            bin_idx = int((x - x_start) / bin_size)
-            if 0 <= bin_idx < num_bins: hit_bins.add(bin_idx)
-        if (len(hit_bins) / float(num_bins)) >= threshold:
+    for (x_start, y_line), x_vals in h_segments.items():
+        occupied_len = get_occupied_length(x_vals, x_start, x_start + grid_size, point_radius)
+        if (occupied_len / grid_size) >= coverage_threshold:
             valid_segments.append(((x_start, y_line), (x_start + grid_size, y_line)))
 
-
     # -----------------------------------------------------------------------
-    # 5. Remove walls that the robot trajectory passes through
+    # Remove walls that the robot trajectory passes through
     # -----------------------------------------------------------------------
     # If the robot path physically crosses a wall segment, that wall cannot be real.
     # It is most likely a false wall produced by noisy perception, snapping, or
     # repeated observations from different viewpoints.
-        
+    
     # Extract the robot trajectory in world coordinates.
     world_trajectory = []
-    for img_name, pose in poses_data.items():
-        rx, ry, theta = pose
+    sorted_pose_keys = sorted(poses_data.keys(), key=natural_sort_key)
+    
+    for img_name in sorted_pose_keys:
+        rx, ry, theta = poses_data[img_name]
         world_trajectory.append((rx, ry))
 
     # Next, filter out walls that the trajectory passes through
@@ -200,7 +223,7 @@ def visualize_map_with_trajectory(walls_path="cache/slam_walls_realtime_cleaned.
             # If the path segment intersects the wall segment, this wall is invalid.
             if segments_intersect(traj_p1, traj_p2, wall_p1, wall_p2):
                 intersected = True
-                break # Move on to the next wall as soon as one collision is found
+                break 
                 
         # Keep only walls that were never crossed by the robot path.
         if not intersected:
@@ -219,16 +242,15 @@ def visualize_map_with_trajectory(walls_path="cache/slam_walls_realtime_cleaned.
     clean_map = np.ones((map_size, map_size, 3), dtype=np.uint8) * 255 
 
     grid_px = int(grid_size * scale)
-    offset_px = int(offset * scale)
     grid_color = (235, 235, 235) 
 
     # Draw vertical faint grid lines to show the maze cell structure.
-    for x in range(offset_x + offset_px, map_size, grid_px): cv2.line(clean_map, (x, 0), (x, map_size), grid_color, 1)
-    for x in range(offset_x - offset_px, -1, -grid_px): cv2.line(clean_map, (x, 0), (x, map_size), grid_color, 1)
-
+    for x in range(offset_x, map_size, grid_px): cv2.line(clean_map, (x, 0), (x, map_size), grid_color, 1)
+    for x in range(offset_x, -1, -grid_px): cv2.line(clean_map, (x, 0), (x, map_size), grid_color, 1)
+    
     # Draw horizontal faint grid lines.
-    for y in range(offset_y + offset_px, map_size, grid_px): cv2.line(clean_map, (0, y), (map_size, y), grid_color, 1)
-    for y in range(offset_y - offset_px, -1, -grid_px): cv2.line(clean_map, (0, y), (map_size, y), grid_color, 1)
+    for y in range(offset_y, map_size, grid_px): cv2.line(clean_map, (0, y), (map_size, y), grid_color, 1)
+    for y in range(offset_y, -1, -grid_px): cv2.line(clean_map, (0, y), (map_size, y), grid_color, 1)
 
     # -----------------------------------------------------------------------
     # Draw the validated wall segments
@@ -240,21 +262,22 @@ def visualize_map_with_trajectory(walls_path="cache/slam_walls_realtime_cleaned.
         py1 = int(offset_y - (y1 * scale))
         px2 = int(offset_x + (x2 * scale))
         py2 = int(offset_y - (y2 * scale))
-        cv2.line(clean_map, (px1, py1), (px2, py2), (0, 0, 0), 3)
+        cv2.line(clean_map, (px1, py1), (px2, py2), (0, 0, 0), 1)
 
-    # -----------------------------------------------------------------------
-    # Reconstruct the trajectory in pixel coordinates
-    # -----------------------------------------------------------------------
-    # We still compute the trajectory points here because they are useful for logging,
-    # debugging, and optional visualization, even though we do not currently draw the
-    # path on the final map.
+    # DEBUG: draw raw points
+    for wx, wy in surviving_walls:
+        px = int(offset_x + (wx * scale))
+        py = int(offset_y - (wy * scale))
+        # cv2.circle(clean_map, (px, py), radius=1, color=(0, 0, 0), thickness=-1)
+
+    # DEBUG: draw trajectory points
     trajectory_pts = []
-    # poses_data is a dictionary where values are [x, y, theta]
-    for img_name, pose in poses_data.items():
-        rx, ry, theta = pose
+    for img_name in sorted_pose_keys:
+        rx, ry, theta = poses_data[img_name]
         px = int(offset_x + (rx * scale))
         py = int(offset_y - (ry * scale))
         trajectory_pts.append((px, py))
+        # cv2.circle(clean_map, (px, py), radius=1, color=(255, 0, 0), thickness=-1)
 
     # -----------------------------------------------------------------------
     # Save and show final result
@@ -262,13 +285,13 @@ def visualize_map_with_trajectory(walls_path="cache/slam_walls_realtime_cleaned.
     # The final cleaned image is saved into cache because the navigation code loads
     # it later as its visual / planning map.
     cv2.imwrite("cache/slam_map_walls_cleaned.png", clean_map)
-    print(f"Success! Map drawn with {len(valid_segments)} walls and trajectory showing {len(trajectory_pts)} poses.")
+    print(f"Success! Map drawn with {len(valid_segments)} walls.")
     cv2.imshow("Final Map with Trajectory", clean_map)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
 # Run the cleanup stage using the default cached inputs.
 if __name__ == "__main__":
-    # 'threshold' controls how much wall evidence is required to keep a wall segment.
+    # 'coverage_threshold' controls how much wall evidence is required to keep a wall segment.
     # Higher threshold = stricter wall filtering, lower threshold = more walls kept.
-    visualize_map_with_trajectory(threshold=0.4)
+    visualize_map_with_trajectory(coverage_threshold=0.5)
