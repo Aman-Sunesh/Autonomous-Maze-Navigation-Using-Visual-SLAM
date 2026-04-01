@@ -1,3 +1,24 @@
+"""
+offline_slam.py
+-------------------------
+This file acts as the main pre-navigation mapping engine. It taks the raw data
+of robot control commands and camera images, processes them frame-by-frame, 
+and generates a rough 2D map of the environment.
+
+What this file does:
+1. Translates recorded velocity commands into Odometry to estimate where the 
+   robot should be at any given time.
+2. Uses a pinhole camera model (Wall Detector) to find the boundary between 
+   the sky and the walls, converting 2D pixels into 3D camera coordinates,
+   then into 2D map coordinates.
+3. Applies a Manhattan Constraint to analyze the geometry of the walls it sees, 
+   gently snapping the robot's heading and position back onto a perfect 90-degree grid.
+4. Analyzes consecutive camera frames (Visual Stuck Detector) to catch when the 
+   robot is sliding, blocked, or stuck against a wall, preventing odometry drift.
+5. Exports the raw wall coordinates and corrected robot poses into the cache directory.
+
+In short, this file generates the map using the exploration data.
+"""
 import os
 import json
 import cv2
@@ -8,8 +29,8 @@ import numpy as np
 # * indicates important paramameter for tunning
 # ---------------------------------------------------------------------------
 # Data paths
-DATA_INFO_PATH = "data_bad/data_info.json"
-IMAGE_DIR = "data_bad/images/"
+DATA_INFO_PATH = "data/images/data_info.json"
+IMAGE_DIR = "data/images/"
 
 # Odometry parameters
 BASE_V = 2.9462             # linear velocity
@@ -18,7 +39,7 @@ BASE_W = 4.27               # angular velocity
 # Camera infos
 CAMERA_W = 320
 CAMERA_H = 240
-CAMERA_F = np.round(CAMERA_W/2.0/np.tan(np.deg2rad(60)))
+CAMERA_F = 92
 K = np.array([[CAMERA_F, 0, CAMERA_W/2.0],
               [0, CAMERA_F, CAMERA_H/2.0],
               [0, 0, 1]])
@@ -31,7 +52,7 @@ MAX_DEPTH = 0.3             # increase: see more depth
 
 # Map Builder parameters
 GRID_M = 0.4                # set grid size as 0.4m x 0.4m
-NEAR_WALL_RADIUS = 0.05     # increase: larger radius to consider robot near a wall
+NEAR_WALL_RADIUS = 0.06     # increase*: larger radius to consider robot near a wall
 
 # Manhattan Constraint parameters
 STEP_SIZE = 3               # increase: use more points to smooth out candidate angles
@@ -44,7 +65,7 @@ MATCH_THRESH = 0.18         # increase*: larger area to snap position fix
 # Visual Stuck Detector parameters
 CONF_THRESH = 0.05          # increase: ignore more uncertain shifts
 DIFF_THRESH = 3.0           # increase: easier to find "STUCK"
-SLIDE_THRESH = 1.5          # increase: harder to find "SLIDING"
+SLIDE_THRESH = 5.0          # increase: harder to find "SLIDING"
 SLOW_ANGLE_THRESH = 0.6     # increase: easier to find "BLOCKED ROT"
 
 
@@ -109,23 +130,14 @@ class WallDetector:
         """
         h, w = fpv.shape[:2]
         
-        # Process image
-        gray = cv2.cvtColor(fpv, cv2.COLOR_BGR2GRAY)    # Convert to grayscale
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)     # Blur to remove texture noise
-
-        # DEBUG: visually check the blurred image
+        # DEBUG: visually check the wall detection
         if self.viz:
-            comparison = np.hstack((gray, blurred))
-            cv2.imshow("Gray (Left) vs Blurred (Right)", comparison)
-        
-        # Find the sky using paint bucket
-        mask = np.zeros((h + 2, w + 2), np.uint8)   # create a blank mask with padding
-        # Find the point where horizontal center, 5 pixels from the very top.
-        paint_point = (w // 2, 5)
-        # Paint the sky with the same color
-        cv2.floodFill(blurred, mask, paint_point, 255, 2, 2, cv2.FLOODFILL_MASK_ONLY)
-        sky_mask = mask[1:-1, 1:-1] # crops the mask by removing padding
-        
+            debug_img = fpv.copy()
+
+        gray = cv2.cvtColor(fpv, cv2.COLOR_BGR2GRAY)
+        # Find the sky mask by keeping only white pixel regions
+        _, sky_mask = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY)
+                
         # Store the calculated (x, y) wall/open space points relative to the robot
         local_walls = []
         local_open_space = []
@@ -136,18 +148,26 @@ class WallDetector:
         # Top-down raycasting to extract the top edge of a wall
         for u in range(step // 2, w, step):         # u = current pixel column: scan the center of the bin
             found_wall = False
-            for v in range(5, int(self.cy) - 5):    # v = current pixel row: scan from top to bottom
+            # If the very top pixel is already a wall, the top is off-screen.
+            if sky_mask[0, u] == 0:
+                continue    # skip
+
+            for v in range(0, int(self.cy)):        # v = current pixel row: scan from top to bottom
                 
                 # If the pixel is not part of the sky mask, it is the top edge of a wall
                 if sky_mask[v, u] == 0:
                     found_wall = True
+                    if self.viz:
+                        cv2.circle(debug_img, (u, v), 2, (0, 0, 255), -1)
+                    
                     # Calculate depth Z from camera model:
                     # y = (fy * Y) / Z where y = cy - v
                     # Z = (fy * Y) / y
                     Y = self.wall_h - self.cam_h 
                     denominator = max((self.cy - v), 1) 
                     Z_cam = (self.fy * Y) / denominator
-                    # Error handler
+                    
+                    # Fallback: ignore if the wall is too far or too close.
                     if Z_cam > self.max_depth or Z_cam <= 0.1:
                         break
                     
@@ -170,7 +190,11 @@ class WallDetector:
                 
                 # Store in the dedicated open space list
                 local_open_space.append((X_local, Y_local))
-                    
+        
+        if self.viz:
+            # Show the exact wall points
+            cv2.imshow("Extracted Wall Edges", debug_img)
+
         return local_walls, local_open_space
 
 class MapBuilder:
@@ -311,7 +335,7 @@ class MapBuilder:
         # Check if any pixel in this local patch is pure black [0, 0, 0] (a drawn wall)
         return np.any(np.all(local_map == [0, 0, 0], axis=-1))
 
-    def draw(self, robot_x, robot_y, theta, img_filename=None):
+    def draw(self, robot_x, robot_y, theta, img_filename=None, current_walls=None):
         """
         Draws the robot's current position in red dot, heading in green line, 
         and historical trajectory in blue line onto the map display.
@@ -324,6 +348,13 @@ class MapBuilder:
             self.frame_poses[img_filename] = (float(robot_x), float(robot_y), float(theta))
 
         display_img = self.grid.copy()
+
+        # DEBUG: show current walls in red dots
+        if current_walls:
+            for wx, wy in current_walls:
+                wpx, wpy = self.world_to_pixel(wx, wy)
+                if 0 <= wpx < self.map_size and 0 <= wpy < self.map_size:
+                    cv2.circle(display_img, (wpx, wpy), 2, (0, 0, 255), -1)
 
         # Draw the trajectory history line in blue
         if len(self.trajectory) > 1:
@@ -502,7 +533,7 @@ class VisualStuckDetector:
         if commanded_v == 0.0 and commanded_w == 0.0:
             self.prev_gray = curr_float
             return 0.0, 0.0, "IDLE", 0.0, 0.0
-
+        
         # Check if near wall
         if not is_near_wall:
             return commanded_v, commanded_w, "MOVING", 0.0, 0.0
@@ -530,7 +561,7 @@ class VisualStuckDetector:
         # 1. Command was 'FORWARD' or 'BACKWARD'
         if commanded_w == 0.0:
             # If the horizontal shift above the slide threshold, the robot is slipping sideways
-            if abs(dx) > self.slide_thresh:
+            if abs(dx) > self.slide_thresh and abs(dx) < 70:    # upper bound to remove false detection
                 return 0.0, visual_w, "SLIDING", mean_diff, dx
         # 2. Command was 'LEFT' or 'RIGHT'
         else:
@@ -575,9 +606,10 @@ def run_slam():
     # Initialize Odometry, Map Builder, Wall Detector, Manhattan Constraint, Visual Stuck Detector
     odom = Odometry(initial_x=0.2, initial_y=0.2, initial_theta=np.pi/2)    # spawn robot in the middle of the hallway
     map_builder = MapBuilder(map_size=800, scale=60.0)
-    wall_detector = WallDetector(K)
+    wall_detector = WallDetector(K, viz=True)
     manhattan_constraint = ManhattanConstraint()
     stuck_detector = VisualStuckDetector(fx=K[0, 0])
+    debug_mode = False                                                      # debug mode: process frame each time a key is pressed
 
     # Error handler while loading
     if not os.path.exists(DATA_INFO_PATH):
@@ -654,8 +686,14 @@ def run_slam():
         # Update the map builder
         map_builder.draw(odom.x, odom.y, odom.theta, img_filename)
         
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        # Wait for the key press
+        delay = 0 if debug_mode else 1
+        key = cv2.waitKey(delay) & 0xFF
+        
+        if key == ord('q'):     # quit
             break
+        elif key == ord('a'):   # toggle debug mode
+            debug_mode = not debug_mode
 
         # Save the current time step to calculate for the next time step
         prev_step = curr_step
