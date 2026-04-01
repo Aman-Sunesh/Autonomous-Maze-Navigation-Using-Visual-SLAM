@@ -8,8 +8,8 @@ import numpy as np
 # * indicates important paramameter for tunning
 # ---------------------------------------------------------------------------
 # Data paths
-DATA_INFO_PATH = "data_old/data_info.json"
-IMAGE_DIR = "data_old/images/"
+DATA_INFO_PATH = "data_bad/data_info.json"
+IMAGE_DIR = "data_bad/images/"
 
 # Odometry parameters
 BASE_V = 2.9462             # linear velocity
@@ -135,6 +135,7 @@ class WallDetector:
         
         # Top-down raycasting to extract the top edge of a wall
         for u in range(step // 2, w, step):         # u = current pixel column: scan the center of the bin
+            found_wall = False
             for v in range(5, int(self.cy) - 5):    # v = current pixel row: scan from top to bottom
                 
                 # If the pixel is not part of the sky mask, it is the top edge of a wall
@@ -161,7 +162,7 @@ class WallDetector:
                     local_walls.append((X_local, Y_local))
                     break
                 
-            # The loop finished without founding a wall
+            # The loop finished without finding a wall
             if not found_wall:
                 Z_cam = self.max_depth
                 X_cam = ((u - self.cx) * Z_cam) / self.fx
