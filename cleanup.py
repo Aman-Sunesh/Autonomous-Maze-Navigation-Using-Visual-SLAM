@@ -253,6 +253,31 @@ def visualize_map_with_trajectory(walls_path="cache/slam_walls.json",
     for y in range(offset_y, -1, -grid_px): cv2.line(clean_map, (0, y), (map_size, y), grid_color, 1)
 
     # -----------------------------------------------------------------------
+    # Draw a solid outer boundary around the maze itself
+    # -----------------------------------------------------------------------
+    # Instead of drawing a border around the whole image canvas, compute the
+    # bounding box of the detected maze wall segments and draw the boundary there.
+    if valid_segments:
+        all_x = []
+        all_y = []
+        for (x1, y1), (x2, y2) in valid_segments:
+            all_x.extend([x1, x2])
+            all_y.extend([y1, y2])
+
+        # Snap the outer maze bounds to the grid so the boundary looks aligned.
+        min_x = math.floor(min(all_x) / grid_size) * grid_size
+        max_x = math.ceil(max(all_x) / grid_size) * grid_size
+        min_y = math.floor(min(all_y) / grid_size) * grid_size
+        max_y = math.ceil(max(all_y) / grid_size) * grid_size
+
+        px1 = int(offset_x + (min_x * scale))
+        py1 = int(offset_y - (max_y * scale))
+        px2 = int(offset_x + (max_x * scale))
+        py2 = int(offset_y - (min_y * scale))
+
+        cv2.rectangle(clean_map, (px1, py1), (px2, py2), (0, 0, 0), 2)
+
+    # -----------------------------------------------------------------------
     # Draw the validated wall segments
     # -----------------------------------------------------------------------
     # At this stage, valid_segments contains only strong, trajectory-consistent wall
