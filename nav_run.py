@@ -300,7 +300,7 @@ class KeyboardPlayerPyGame(Player):
 
         # Camera model and wall detector used during live correction.
         CAMERA_W, CAMERA_H = 320, 240
-        CAMERA_F = np.round(CAMERA_W / 2.0 / np.tan(np.deg2rad(60)))
+        CAMERA_F = 92
         self.K = np.array([[CAMERA_F, 0, CAMERA_W / 2.0],
                            [0, CAMERA_F, CAMERA_H / 2.0],
                            [0, 0, 1]])
