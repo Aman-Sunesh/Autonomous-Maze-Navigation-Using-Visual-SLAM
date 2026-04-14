@@ -232,85 +232,177 @@ def visualize_map_with_trajectory(walls_path="cache/slam_walls.json",
     valid_segments = filtered_segments
 
     # -----------------------------------------------------------------------
-    # Create final visualization canvas with faint grid
+    # Create final visualization canvas (True Discrete Occupancy Grid)
     # -----------------------------------------------------------------------
-    # The final map is white with a light gray background grid so the maze structure
-    # is easy to read. This is only for readability; the black walls are the main
-    # output used later.
     offset_x = map_size // 2
     offset_y = map_size // 2
-    clean_map = np.ones((map_size, map_size, 3), dtype=np.uint8) * 255 
-
-    grid_px = int(grid_size * scale)
-    grid_color = (235, 235, 235) 
-
-    # Draw vertical faint grid lines to show the maze cell structure.
-    for x in range(offset_x, map_size, grid_px): cv2.line(clean_map, (x, 0), (x, map_size), grid_color, 1)
-    for x in range(offset_x, -1, -grid_px): cv2.line(clean_map, (x, 0), (x, map_size), grid_color, 1)
     
-    # Draw horizontal faint grid lines.
-    for y in range(offset_y, map_size, grid_px): cv2.line(clean_map, (0, y), (map_size, y), grid_color, 1)
-    for y in range(offset_y, -1, -grid_px): cv2.line(clean_map, (0, y), (map_size, y), grid_color, 1)
+    # 1. Load the raw raycasted map from the offline SLAM stage
+    base_map_path = "cache/slam_map.png"
+    if not os.path.exists(base_map_path):
+        print("Error: slam_map.png not found. Cannot perform grid processing.")
+        return
+        
+    raw_map = cv2.imread(base_map_path)
+    gray_map = cv2.cvtColor(raw_map, cv2.COLOR_BGR2GRAY)
+    
+    # Background: Start with a solid GRAY canvas
+    discrete_map = np.ones((map_size, map_size, 3), dtype=np.uint8) * 127
+
+    # Grid Processing Parameters
+    visual_grid_size = 0.4
+    grid_px = int(visual_grid_size * scale) 
+    white_threshold = 0.6
+    
+    start_x = offset_x % grid_px
+    start_y = offset_y % grid_px
+
+    # Calculate grid array dimensions
+    y_steps = list(range(start_y, map_size, grid_px))
+    x_steps = list(range(start_x, map_size, grid_px))
+    
+    # Logical state grid: 0 = Gray, 1 = White, 2 = Black
+    grid_states = np.zeros((len(y_steps), len(x_steps)), dtype=np.uint8)
+
+    # Helper function to get world coordinates for a grid cell center
+    def get_world_center(i, j):
+        px = x_steps[j] + grid_px / 2.0
+        py = y_steps[i] + grid_px / 2.0
+        wx = (px - offset_x) / scale
+        wy = (offset_y - py) / scale
+        return (wx, wy)
 
     # -----------------------------------------------------------------------
-    # Draw a solid outer boundary around the maze itself
+    # PASS 1: Color Whites for Whites
     # -----------------------------------------------------------------------
-    # Instead of drawing a border around the whole image canvas, compute the
-    # bounding box of the detected maze wall segments and draw the boundary there.
-    if valid_segments:
-        all_x = []
-        all_y = []
-        for (x1, y1), (x2, y2) in valid_segments:
-            all_x.extend([x1, x2])
-            all_y.extend([y1, y2])
+    for i, y in enumerate(y_steps):
+        for j, x in enumerate(x_steps):
+            y_end = min(y + grid_px, map_size)
+            x_end = min(x + grid_px, map_size)
+            
+            cell = gray_map[y:y_end, x:x_end]
+            total_pixels = cell.shape[0] * cell.shape[1]
+            if total_pixels == 0: continue
+                
+            white_pixels = np.sum(cell > 240)
+            white_ratio = white_pixels / total_pixels
+            
+            if white_ratio >= white_threshold:
+                grid_states[i, j] = 1  # Mark as White
 
-        # Snap the outer maze bounds to the grid so the boundary looks aligned.
-        min_x = math.floor(min(all_x) / grid_size) * grid_size
-        max_x = math.ceil(max(all_x) / grid_size) * grid_size
-        min_y = math.floor(min(all_y) / grid_size) * grid_size
-        max_y = math.ceil(max(all_y) / grid_size) * grid_size
-
-        px1 = int(offset_x + (min_x * scale))
-        py1 = int(offset_y - (max_y * scale))
-        px2 = int(offset_x + (max_x * scale))
-        py2 = int(offset_y - (min_y * scale))
-
-        cv2.rectangle(clean_map, (px1, py1), (px2, py2), (0, 0, 0), 2)
     # -----------------------------------------------------------------------
-    # Draw the validated wall segments
+    # PASS 2: Color Black if 3+ surrounding are Gray (with wall check)
     # -----------------------------------------------------------------------
-    # At this stage, valid_segments contains only strong, trajectory-consistent wall
-    # segments. These are drawn as bold black lines on the final clean map.
+    final_states = grid_states.copy()
+    for i in range(len(y_steps)):
+        for j in range(len(x_steps)):
+            
+            # Only check cells that are currently Gray (0)
+            if grid_states[i, j] == 0:
+                gray_count = 0
+                white_neighbors = []
+                
+                # Check Up (treat edges as Gray)
+                if i == 0 or grid_states[i-1, j] == 0: 
+                    gray_count += 1
+                elif grid_states[i-1, j] == 1:
+                    white_neighbors.append((i-1, j))
+                    
+                # Check Down
+                if i == len(y_steps)-1 or grid_states[i+1, j] == 0: 
+                    gray_count += 1
+                elif grid_states[i+1, j] == 1:
+                    white_neighbors.append((i+1, j))
+                    
+                # Check Left
+                if j == 0 or grid_states[i, j-1] == 0: 
+                    gray_count += 1
+                elif grid_states[i, j-1] == 1:
+                    white_neighbors.append((i, j-1))
+                    
+                # Check Right
+                if j == len(x_steps)-1 or grid_states[i, j+1] == 0: 
+                    gray_count += 1
+                elif grid_states[i, j+1] == 1:
+                    white_neighbors.append((i, j+1))
+                
+                if gray_count >= 3:
+                    becomes_black = True
+                    
+                    # If there's an adjacent white cell, ensure a wall separates them
+                    for ni, nj in white_neighbors:
+                        p1 = get_world_center(i, j)
+                        p2 = get_world_center(ni, nj)
+                        wall_between = False
+                        
+                        for wall_p1, wall_p2 in valid_segments:
+                            if segments_intersect(p1, p2, wall_p1, wall_p2):
+                                wall_between = True
+                                break
+                        
+                        # Adjacent white cell without a wall means it should stay Gray
+                        if not wall_between:
+                            becomes_black = False
+                            break
+                            
+                    if becomes_black:
+                        final_states[i, j] = 2  # Mark as Black
+
+    # -----------------------------------------------------------------------
+    # RENDER THE GRID
+    # -----------------------------------------------------------------------
+    for i, y in enumerate(y_steps):
+        for j, x in enumerate(x_steps):
+            y_end = min(y + grid_px, map_size)
+            x_end = min(x + grid_px, map_size)
+            
+            state = final_states[i, j]
+            if state == 1:
+                color = (255, 255, 255) # White
+            elif state == 2:
+                color = (0, 0, 0)       # Black
+            else:
+                color = (220, 220, 220) # Gray
+                
+            cv2.rectangle(discrete_map, (x, y), (x_end - 1, y_end - 1), color, -1)
+
+    # Draw faint gray grid lines to separate the cells visually
+    grid_color = (200, 200, 200)
+    for x in range(start_x, map_size, grid_px): cv2.line(discrete_map, (x, 0), (x, map_size), grid_color, 1)
+    for y in range(start_y, map_size, grid_px): cv2.line(discrete_map, (0, y), (map_size, y), grid_color, 1)
+
+    # Walls: Draw the validated wall segments ON TOP
+    all_x, all_y = [], []
     for (x1, y1), (x2, y2) in valid_segments:
+        all_x.extend([x1, x2])
+        all_y.extend([y1, y2])
+        
         px1 = int(offset_x + (x1 * scale))
         py1 = int(offset_y - (y1 * scale))
         px2 = int(offset_x + (x2 * scale))
         py2 = int(offset_y - (y2 * scale))
-        cv2.line(clean_map, (px1, py1), (px2, py2), (0, 0, 0), 2)
+        cv2.line(discrete_map, (px1, py1), (px2, py2), (0, 0, 0), 2)
 
-    # DEBUG: draw raw points
-    for wx, wy in surviving_walls:
-        px = int(offset_x + (wx * scale))
-        py = int(offset_y - (wy * scale))
-        # cv2.circle(clean_map, (px, py), radius=1, color=(0, 0, 0), thickness=-1)
+    # Outer Boundary: Draw the rectangle around the maze
+    if all_x and all_y:
+        boundary_grid = 0.4
+        min_x = round(min(all_x) / boundary_grid) * boundary_grid
+        max_x = round(max(all_x) / boundary_grid) * boundary_grid
+        min_y = round(min(all_y) / boundary_grid) * boundary_grid
+        max_y = round(max(all_y) / boundary_grid) * boundary_grid
 
-    # DEBUG: draw trajectory points
-    trajectory_pts = []
-    for img_name in sorted_pose_keys:
-        rx, ry, theta = poses_data[img_name]
-        px = int(offset_x + (rx * scale))
-        py = int(offset_y - (ry * scale))
-        trajectory_pts.append((px, py))
-        # cv2.circle(clean_map, (px, py), radius=1, color=(255, 0, 0), thickness=-1)
+        bx1 = int(offset_x + (min_x * scale))
+        by1 = int(offset_y - (max_y * scale))
+        bx2 = int(offset_x + (max_x * scale))
+        by2 = int(offset_y - (min_y * scale))
+        cv2.rectangle(discrete_map, (bx1, by1), (bx2, by2), (0, 0, 0), 4)
 
     # -----------------------------------------------------------------------
     # Save and show final result
     # -----------------------------------------------------------------------
-    # The final cleaned image is saved into cache because the navigation code loads
-    # it later as its visual / planning map.
-    cv2.imwrite("cache/slam_map_walls_cleaned.png", clean_map)
-    print(f"Success! Map drawn with {len(valid_segments)} walls.")
-    cv2.imshow("Final Map with Trajectory", clean_map)
+    cv2.imwrite("cache/slam_map_walls_cleaned.png", discrete_map)
+    print("Success! Discrete Occupancy Grid generated.")
+    cv2.imshow("Discrete Occupancy Grid", discrete_map)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
@@ -318,4 +410,4 @@ def visualize_map_with_trajectory(walls_path="cache/slam_walls.json",
 if __name__ == "__main__":
     # 'coverage_threshold' controls how much wall evidence is required to keep a wall segment.
     # Higher threshold = stricter wall filtering, lower threshold = more walls kept.
-    visualize_map_with_trajectory(coverage_threshold=0.5)
+    visualize_map_with_trajectory(coverage_threshold=0.3)
