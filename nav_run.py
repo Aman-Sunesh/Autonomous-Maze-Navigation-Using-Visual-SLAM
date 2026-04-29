@@ -37,8 +37,8 @@ import time
 # Constants
 # ---------------------------------------------------------------------------
 CACHE_DIR = "cache"
-IMAGE_DIR = "data/exploration_images/traj_0"
-DATA_INFO_PATH = "data/data_info.json"
+DATA_INFO_PATH = "data/traj_0/data_info.json"
+IMAGE_DIR = "data/traj_0"
 PATH_CACHE_FILE = os.path.join(CACHE_DIR, "astar_path_cache.pkl")
 
 # Graph construction settings.
@@ -290,7 +290,7 @@ class KeyboardPlayerPyGame(Player):
         self.goal_world_coords = None      # (gx, gy)
         self.is_autonomous = False
         self.lookahead_dist = 0.45
-        self.goal_reach_dist = 0.0125
+        self.goal_reach_dist = 0.02
         self.path_replan_dist = 0.40
 
         super().__init__()
@@ -309,6 +309,10 @@ class KeyboardPlayerPyGame(Player):
         self.historic_v_walls = []
         self.historic_h_walls = []
         self.MATCH_THRESHOLD = 0.15
+
+        # Manhattan Thresh
+        self.frame_thresh = 250
+        self.turn_tol = 8
 
         # Load the exploration trajectory and keep only pure single-action frames.
         # We subsample them because we want a compact but still useful visual database.
@@ -662,12 +666,12 @@ class KeyboardPlayerPyGame(Player):
         if goal_dist < 0.08:
             TURN_TOL = np.deg2rad(40)
         else:
-            TURN_TOL = np.deg2rad(4)
+            TURN_TOL = np.deg2rad(self.turn_tol)
 
         # Before committing to forward motion, do a short rollout on the map.
         # If that rollout would hit a wall, rotate first instead of pushing forward.
-        if not self._is_forward_safe(samples=5, step_dt=0.01):
-            return Action.LEFT if heading_error >= 0 else Action.RIGHT
+        # if not self._is_forward_safe(samples=5, step_dt=0.01):
+        #     return Action.LEFT if heading_error >= 0 else Action.RIGHT
 
         # Turn in place until reasonably aligned to the next path segment
         if heading_error > TURN_TOL:
@@ -798,10 +802,10 @@ class KeyboardPlayerPyGame(Player):
             # Every few frames, use the wall detector to estimate the dominant wall
             # direction and softly pull the heading back toward the nearest Manhattan
             # orientation. This keeps the pose from slowly rotating away from the maze.
-            if self.frame_count >= 200 and self.odom is not None:   # skip 200 frames for fast processing
+            if self.frame_count >= self.frame_thresh and self.odom is not None:   # skip 200 frames for fast processing
                 all_local = self.wall_detector.extract_wall_points(self.fpv)
-                self.frame_count -= 200                             # revert 200 back for the next processing
-                
+                self.frame_count -= self.frame_thresh                             # revert 200 back for the next processing
+
                 if len(all_local) > 15:
                     pts = np.array(all_local, dtype=np.float32)
                     step_size = 3
@@ -832,13 +836,13 @@ class KeyboardPlayerPyGame(Player):
                         
                         # Soft heading correction only. This keeps the correction stable
                         # and avoids sudden jumps.
-                        self.odom.theta += heading_error * 0.15
+                        self.odom.theta += heading_error * 0.8
                         self.odom.theta = (self.odom.theta + np.pi) % (2 * np.pi) - np.pi
                         
                         # In manual mode only, also allow gentle x/y correction based on
                         # recurring wall locations. In auto mode we avoid this because it
                         # can make the map marker move while the real robot is actually stuck.
-                        if self.is_autonomous:
+                        if True:
                             inlier_mask_pts = np.append(inlier_mask_segments, [False]*step_size)
                             valid_local_pts = pts[inlier_mask_pts]
                             
@@ -852,7 +856,7 @@ class KeyboardPlayerPyGame(Player):
                                 norm_target = (target_global_angle + np.pi) % (2 * np.pi) - np.pi
                                 is_horizontal = np.isclose(abs(norm_target), 0.0, atol=0.1) or np.isclose(abs(norm_target), np.pi, atol=0.1)
                                 is_vertical = np.isclose(abs(norm_target), np.pi/2.0, atol=0.1)
-                                translation_gain = 0.6
+                                translation_gain = 0.8
                                 GRID_SIZE = 0.4
 
                                 # Normalize target angle to stay within -pi to pi
@@ -874,8 +878,14 @@ class KeyboardPlayerPyGame(Player):
                                     if abs(target_x - mean_wall_x) < 0.18:
                                         # Gently adjust the robot's x position toward the idead x position
                                         self.odom.x += (target_x - mean_wall_x) * translation_gain
-                if self.viz:
-                    self.display_global_map()
+            
+            # 1. Always render the map if viz is enabled and we are localized
+            if self.viz and self.odom is not None:
+                self.display_global_map()
+                
+            # 2. Increment frame_count here so that wall-correction  actually runs in manual mode
+            if not self.is_autonomous:
+                self.frame_count += 1 
 
         # Always refresh the live FPV display, even if we are not currently navigating.
         rgb = fpv[:, :, ::-1]
@@ -958,7 +968,7 @@ class KeyboardPlayerPyGame(Player):
         if not targets:
             return
 
-        front = targets[0]   # only use front view
+        front = targets[0]   # target image
         feat = self.extractor.extract(front)
         sims = self.database @ feat
 
@@ -967,12 +977,103 @@ class KeyboardPlayerPyGame(Player):
             smooth[i] = 0.25 * sims[i - 1] + 0.5 * sims[i] + 0.25 * sims[i + 1]
 
         self.goal_node = int(np.argmax(smooth))
-
         goal_file = self.file_list[self.goal_node]
+
         if goal_file in self.frame_poses:
-            gx, gy, _ = self.frame_poses[goal_file]
+            gx, gy, gtheta = self.frame_poses[goal_file]
+            
+            # --- OPENCV ESSENTIAL MATRIX REFINEMENT ---
+            match_img = cv2.imread(os.path.join(IMAGE_DIR, goal_file))
+            if match_img is not None:
+                sift = cv2.SIFT_create()
+                kp1, des1 = sift.detectAndCompute(front, None)
+                kp2, des2 = sift.detectAndCompute(match_img, None)
+                
+                # 1. Match SIFT features
+                bf = cv2.BFMatcher()
+                matches = bf.knnMatch(des1, des2, k=2)
+                
+                # 2. Apply Lowe's ratio test
+                good = []
+                for m, n in matches:
+                    if m.distance < 0.75 * n.distance:
+                        good.append(m)
+                
+                # 3. Need enough points for Essential Matrix
+                if len(good) >= 8: 
+                    pts_target = np.float32([kp1[m.queryIdx].pt for m in good])
+                    pts_match = np.float32([kp2[m.trainIdx].pt for m in good])
+                    
+                    # 4. Compute Essential Matrix
+                    E, mask_pose = cv2.findEssentialMat(pts_target, pts_match, self.K, method=cv2.RANSAC, prob=0.999, threshold=1.0)
+                    
+                    if E is not None and E.shape == (3, 3):
+                        # 5. Recover Relative Pose (R, t)
+                        _, R, t, mask_recover = cv2.recoverPose(E, pts_target, pts_match, self.K)
+                        
+                        # --- ABSOLUTE SCALE RECOVERY ---
+                        # Filter down to strictly the inlier SIFT points that survived RANSAC
+                        inlier_pts_target = np.array([pts_target[i] for i in range(len(mask_recover)) if mask_recover[i][0]]).T
+                        inlier_pts_match = np.array([pts_match[i] for i in range(len(mask_recover)) if mask_recover[i][0]]).T
+                        
+                        if inlier_pts_target.shape[1] > 0:
+                            # A. Triangulate the 3D points using the unit scale (Z_unit)
+                            P1 = self.K @ np.hstack((np.eye(3), np.zeros((3,1))))
+                            P2 = self.K @ np.hstack((R, t))
+                            points_4d = cv2.triangulatePoints(P1, P2, inlier_pts_target, inlier_pts_match)
+                            points_3d = points_4d[:3, :] / points_4d[3, :]
+                            
+                            # B. Build the Sky Mask to find true wall depths
+                            h, w = front.shape[:2]
+                            gray = cv2.cvtColor(front, cv2.COLOR_BGR2GRAY)
+                            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+                            sky_mask_img = np.zeros((h + 2, w + 2), np.uint8)
+                            cv2.floodFill(blurred, sky_mask_img, (w // 2, 5), 255, 2, 2, cv2.FLOODFILL_MASK_ONLY)
+                            sky_mask = sky_mask_img[1:-1, 1:-1]
+                            
+                            delta_h = self.wall_detector.wall_h - self.wall_detector.cam_h 
+                            cy = int(self.K[1, 2])
+                            fy = self.K[1, 1]
+                            
+                            scales = []
+                            
+                            # C. Compare Triangulated Depth vs True Depth
+                            for i in range(inlier_pts_target.shape[1]):
+                                u = int(inlier_pts_target[0, i])
+                                if not (0 <= u < w): continue
+                                
+                                # Raycast down column 'u' to find the wall top
+                                z_true = None
+                                for v in range(5, cy - 5):
+                                    if sky_mask[v, u] == 0:
+                                        z_true = (fy * delta_h) / max((cy - v), 1)
+                                        break
+                                
+                                if z_true is not None:
+                                    z_unit = points_3d[2, i] # The Z depth from the camera matrix
+                                    if z_unit > 0.05:        # Prevent division by zero
+                                        scales.append(z_true / z_unit)
+                            
+                            # D. Take the Median to ignore noise
+                            SCALE = np.median(scales) if len(scales) > 0 else 0.2
+                        else:
+                            SCALE = 0.2
+
+                        print(f"[SCALE RECOVERY] Calculated Scale Factor: {SCALE:.3f} meters")
+
+                        # 6. Apply Scale and rotate local translation into the global map frame
+                        dx_local = float(t[2]) * SCALE  
+                        dy_local = float(-t[0]) * SCALE 
+                        
+                        dx_global = dx_local * np.cos(gtheta) - dy_local * np.sin(gtheta)
+                        dy_global = dx_local * np.sin(gtheta) + dy_local * np.cos(gtheta)
+                        
+                        self.goal_world_coords = (gx + dx_global, gy + dy_global)
+                        print(f"[GOAL] Epipolar Refined: ({gx:.2f}, {gy:.2f}) -> ({self.goal_world_coords[0]:.2f}, {self.goal_world_coords[1]:.2f})")
+                        return
+
             self.goal_world_coords = (gx, gy)
-            print(f"[GOAL] node={self.goal_node}, world=({gx:.2f}, {gy:.2f})")
+            print(f"[GOAL] node={self.goal_node}, world=({gx:.2f}, {gy:.2f}) (Fallback to exact match)")
         else:
             print(f"[GOAL] Warning: {goal_file} not found in frame_poses")
 
@@ -1022,16 +1123,18 @@ class KeyboardPlayerPyGame(Player):
 
     def display_global_map(self):
         """Show the global metric map with the current pose, target, and A* path."""
-        if self.slam_map is None or self.goal_node is None: return
+        # Wait until both the map and the refined goal coordinates exist
+        if self.slam_map is None or self.goal_world_coords is None: return
         display_map = self.slam_map.copy()
 
-        goal_file = self.file_list[self.goal_node]
-        if goal_file in self.frame_poses:
-            gx, gy, _ = self.frame_poses[goal_file]
-            gpx, gpy = self.world_to_pixel(gx, gy)
-            cv2.circle(display_map, (gpx, gpy), 10, (0, 0, 255), -1) 
-            cv2.putText(display_map, "TARGET", (gpx + 15, gpy - 15), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+        # Use refined goal
+        gx, gy = self.goal_world_coords
+        gpx, gpy = self.world_to_pixel(gx, gy)
+        
+        # Draw the target circle and text
+        cv2.circle(display_map, (gpx, gpy), 10, (0, 0, 255), -1) 
+        cv2.putText(display_map, "TARGET", (gpx + 15, gpy - 15), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
 
         # Draw A* geometric shortest path (blue/cyan style)
         if self.global_path:
