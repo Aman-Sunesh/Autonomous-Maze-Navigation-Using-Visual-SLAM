@@ -29,8 +29,8 @@ import numpy as np
 # * indicates important paramameter for tunning
 # ---------------------------------------------------------------------------
 # Data paths
-DATA_INFO_PATH = "data/images/data_info.json"
-IMAGE_DIR = "data/images/"
+DATA_INFO_PATH = "data/traj_0/data_info.json"
+IMAGE_DIR = "data/traj_0"
 
 # Odometry parameters
 BASE_V = 2.9462             # linear velocity
@@ -52,7 +52,7 @@ MAX_DEPTH = 0.3             # increase: see more depth
 
 # Map Builder parameters
 GRID_M = 0.4                # set grid size as 0.4m x 0.4m
-NEAR_WALL_RADIUS = 0.06     # increase*: larger radius to consider robot near a wall
+NEAR_WALL_RADIUS = 0.08     # increase*: larger radius to consider robot near a wall
 
 # Manhattan Constraint parameters
 STEP_SIZE = 3               # increase: use more points to smooth out candidate angles
@@ -66,7 +66,7 @@ MATCH_THRESH = 0.18         # increase*: larger area to snap position fix
 CONF_THRESH = 0.05          # increase: ignore more uncertain shifts
 DIFF_THRESH = 3.0           # increase: easier to find "STUCK"
 SLIDE_THRESH = 5.0          # increase: harder to find "SLIDING"
-SLOW_ANGLE_THRESH = 0.6     # increase: easier to find "BLOCKED ROT"
+SLOW_ANGLE_THRESH = 5.0     # increase: easier to find "BLOCKED ROT"
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +514,7 @@ class VisualStuckDetector:
         self.conf_thresh = conf_thresh      
         self.slow_angle_thresh = slow_angle_thresh    
         self.prev_gray = None
+        self.prev_dx = 0
 
     def filter_actions(self, curr_img, commanded_v, commanded_w, dt, is_near_wall):
         """
@@ -522,6 +523,12 @@ class VisualStuckDetector:
         """
         # Convert to grayscale and to 32-bit floats for cv2.phaseCorrelate
         curr_gray = cv2.cvtColor(curr_img, cv2.COLOR_BGR2GRAY)
+
+        # h = curr_gray.shape[0]
+        # crop_top = int(h * 0.2)  # Cut off the top 40% (sky and distant walls)
+        
+        # # Only use the bottom 60% of the image for shift detection
+        # curr_cropped = curr_gray[crop_top:h, :]
         curr_float = np.float32(curr_gray)
 
         # Initialization check
@@ -536,12 +543,16 @@ class VisualStuckDetector:
         
         # Check if near wall
         if not is_near_wall:
+            self.prev_gray = curr_float
             return commanded_v, commanded_w, "MOVING", 0.0, 0.0
 
         # Calculate the pixel shift between the previous and current frame
-        shift, confidence = cv2.phaseCorrelate(self.prev_gray, curr_float)
-        dx, dy = shift      # unpack the shift into horizontal and vertical
+        # Use Hann filter for robustness
+        hann = cv2.createHanningWindow((curr_gray.shape[1], curr_gray.shape[0]), cv2.CV_32F)
+        shift, confidence = cv2.phaseCorrelate(self.prev_gray, curr_float, hann)
 
+        dx, dy = shift      # unpack the shift into horizontal and vertical
+        
         # Ignore the calculated shift if low confidence
         if confidence < self.conf_thresh:
             dx = 0.0
@@ -560,6 +571,7 @@ class VisualStuckDetector:
 
         # 1. Command was 'FORWARD' or 'BACKWARD'
         if commanded_w == 0.0:
+            print(dx)
             # If the horizontal shift above the slide threshold, the robot is slipping sideways
             if abs(dx) > self.slide_thresh and abs(dx) < 70:    # upper bound to remove false detection
                 return 0.0, visual_w, "SLIDING", mean_diff, dx
@@ -604,7 +616,7 @@ def run_slam():
     """
 
     # Initialize Odometry, Map Builder, Wall Detector, Manhattan Constraint, Visual Stuck Detector
-    odom = Odometry(initial_x=0.2, initial_y=0.2, initial_theta=np.pi/2)    # spawn robot in the middle of the hallway
+    odom = Odometry(initial_x=3.4, initial_y=-5.4, initial_theta=np.pi/2)    # spawn robot in the middle of the hallway
     map_builder = MapBuilder(map_size=800, scale=60.0)
     wall_detector = WallDetector(K, viz=True)
     manhattan_constraint = ManhattanConstraint()
@@ -630,6 +642,9 @@ def run_slam():
         curr_step = frame['step']
         actions = frame['action']
         img_filename = frame.get('image', None)
+
+        # if curr_step < 1400:
+        #     continue
 
         # Calculate the time step (dt): set each step is 0.01 second.
         dt = 0.01 if prev_step is None else (curr_step - prev_step) * 0.01
